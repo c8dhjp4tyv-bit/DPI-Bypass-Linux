@@ -11,7 +11,7 @@ set -euo pipefail
 
 APP_NAME="DPI Bypass"
 APP_ID="xyz.atomland.DpiBypass"
-APP_VERSION="1.1.0"
+APP_VERSION="1.2.0"
 REPO="${DPI_BYPASS_REPO:-atomgameraga/DPI-Bypass-Linux}"
 BRANCH="${DPI_BYPASS_BRANCH:-main}"
 
@@ -144,11 +144,11 @@ install_dependencies() {
             ;;
         eopkg)
             try_install eopkg python3 python-gobject libgtk-4 libadwaita \
-                nftables iproute2 networkmanager polkit curl
+                nftables iproute2 iw networkmanager polkit curl
             ;;
         emerge)
             warn "Gentoo saptandı; paketleri kendiniz kurmanız gerekebilir:"
-            printf '    dev-python/pygobject gui-libs/gtk:4 gui-libs/libadwaita net-firewall/nftables\n'
+            printf '    dev-python/pygobject gui-libs/gtk:4 gui-libs/libadwaita net-firewall/nftables sys-apps/iproute2 net-wireless/iw\n'
             ;;
         *)
             warn "Paket yöneticisi tanınamadı; bağımlılıklar elle kurulmalı."
@@ -173,6 +173,11 @@ check_requirements() {
     else
         die "nftables ya da iptables gerekli."
     fi
+
+    command -v tc >/dev/null 2>&1 || \
+        warn "tc bulunamadı; Ping düşürme qdisc optimizasyonunu atlayacak."
+    command -v iw >/dev/null 2>&1 || \
+        warn "iw bulunamadı; Ping düşürme Wi-Fi güç ayarını atlayacak."
 }
 
 # ------------------------------------------------------------- kaynak ------

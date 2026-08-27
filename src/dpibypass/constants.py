@@ -33,6 +33,11 @@ VODAFONE_MAX_NETWORKS = 10
 # sonlanırsa --cleanup dalı değeri buradan okuyup geri yazabilir.
 VODAFONE_STATE_FILE = os.path.join(RUN_DIR, "vodafone.json")
 
+# Ping düşürme kipinin değiştirdiği geçici ayarların geri alma tarifi. Dosya
+# /run altında olduğu için yeniden başlatmada kalıcı sistem ayarı bırakılmaz;
+# servis çöküp systemd tarafından yeniden başlatılırsa önce bu tarif uygulanır.
+LATENCY_STATE_FILE = os.path.join(RUN_DIR, "latency.json")
+
 # pkexec ile çağrılan yetkilendirme yardımcısı (install.sh buraya kurar).
 VODAFONE_HELPER = "/usr/libexec/dpi-bypass/vodafone-helper"
 VODAFONE_ACTION = "xyz.atomland.DpiBypass.vodafone-mode"

@@ -29,6 +29,8 @@ DEFAULTS: dict[str, Any] = {
     "disabled_domains": [],
     "gui_autostart": True,
     "verbose": False,
+    # --- Ölçümlü düşük gecikme kipi ----------------------------------------
+    "latency_mode": False,
     # --- Vodafone sınırsız kipi ---------------------------------------------
     "vodafone_mode": False,             # ana anahtar
     "vodafone_networks": [],            # [{"key","name","interface"}, ...]

@@ -9,7 +9,8 @@ yeniden bulan GNOME uygulaması.**
 
 Discord başta olmak üzere derin paket incelemesi (DPI) ile engellenen sitelere
 erişimi açar. VPN değildir: trafik başka bir ülkeye çıkmaz, ping ve gecikme
-etkilenmez.
+atlatma için başka bir sunucuya taşınmaz. İsteğe bağlı **Ping düşürme (Beta)**
+kipi ise yalnız bilgisayardaki doğrulanabilir yerel gecikme nedenlerini ölçer.
 
 *Yazan: Atom Gamer Arda A.G.A*
 
@@ -46,6 +47,7 @@ sudo bash install.sh --uninstall
 | **DNS** | Sistemin tüm DNS trafiği (53/udp, 53/tcp) yerel köprüye yönlendirilir ve **DNS-over-HTTPS** ile taşınır. Birincil **Cloudflare**, yedekler **Google** ve **Quad9**. DNS zehirlenmesi ve DNS düzeyindeki engel böylece tamamen aşılır. |
 | **DPI** | Engelli hedeflere giden TCP 80/443 bağlantıları yerel şeffaf vekile düşer. İlk istemci verisi (TLS ClientHello / HTTP isteği) seçilen stratejiye göre yeniden şekillendirilerek gönderilir; sunucu veriyi eksiksiz alır, yol üstündeki DPI ise SNI'yi göremez. |
 | **QUIC** | İsteğe bağlı olarak engelli hedeflere UDP/443 reddedilir; tarayıcılar atlatma uygulanabilen TCP'ye döner. |
+| **Ping düşürme (Beta)** | Aktif fiziksel arayüzde Wi-Fi güç tasarrufunu ve yalnız güvenle geri yüklenebilen basit FIFO kuyrukları değerlendirir. Önce/sonra RTT, jitter ve paket kaybını ölçer; doğrulanmış kazanç yoksa değişikliği geri alır. |
 | **Diğer trafik** | Yönlendirilmez. ICMP (ping), oyun/VoIP UDP trafiği, torrent, VPN — hiçbiri vekilden geçmez, ölçülebilir bir etki oluşmaz. |
 
 ### Atlatma yöntemleri
@@ -102,6 +104,42 @@ başarısız bağlantılar sayılır ve arama kendiliğinden tekrarlanır.
 - Dilediğiniz alan adını arayüzden elle de ekleyebilirsiniz (alt alan adları
   kapsanır).
 - "Tüm siteler" kipinde 80/443'ün tamamı vekilden geçer.
+
+---
+
+## Ping düşürme (Beta)
+
+Bu özellik bir VPN değildir; ISP rotasını, fiziksel mesafeyi veya uzak
+sunucunun yükünü değiştiremez ve her ağda daha düşük ping garanti etmez. Esas
+amacı bilgisayar kaynaklı yerel kuyruklanma ve jitter nedenlerini azaltmaktır.
+
+Kip açıldığında varsayılan ağ geçidi ile IP tabanlı kararlı uzak hedeflerden
+birden fazla örnek alınır. Median/minimum/p95 RTT, jitter ve paket kaybı ayrı
+hesaplanır. ICMP kullanılamazsa DNS çözümleme süresini karıştırmayan doğrudan
+TCP-connect ölçümüne geçilir. Ardından yalnız desteklenen ayarlar denenir:
+
+- Wi-Fi arayüzünde sürücü destekliyorsa runtime güç tasarrufu kapatılır.
+- Mevcut kök qdisc yalnız `pfifo`, `bfifo` veya `pfifo_fast` gibi eksiksiz
+  geri yüklenebilir basit bir FIFO ise `fq_codel` denenir.
+- `cake`, `fq_codel`, `fq`, `mq`, `noqueue` ve tüm bilinmeyen/custom qdisc
+  yapıları korunur.
+
+Değişiklikten sonra aynı çoklu örnek ölçümü tekrarlanır. Paket kaybı artarsa,
+bağlantı kesilirse, RTT/jitter kötüleşirse veya fark ölçüm gürültüsünden açıkça
+büyük değilse eski ayarlar otomatik geri alınır. Ağ değişiminde önce eski
+arayüz geri yüklenir; servis kapanırken ve `dpi-bypassd --cleanup` çalışırken
+de aynı idempotent geri alma tarifi kullanılır.
+
+DNS, MTU, rota, DHCP, IPv6, firewall, TCP buffer/sysctl, BBR, ECN ve CPU
+governor ayarları bu kipin kapsamı dışındadır. Doğrulanmış kazanç yoksa arayüz
+bunu açıkça söyler; tahmini milisaniye veya yüzde göstermez.
+
+```bash
+dpi-bypass latency status
+dpi-bypass latency on
+dpi-bypass latency off
+dpi-bypass latency test
+```
 
 ---
 
@@ -188,6 +226,7 @@ dpi-bypass logs -f         # canlı günlük
 dpi-bypass set mode=all dns_provider=quad9
 dpi-bypass disable / enable
 dpi-bypass vodafone status  # hotspot TTL düzeltmesi (on / off)
+dpi-bypass latency status   # Ping düşürme (on / off / test)
 ```
 
 ---
@@ -228,6 +267,7 @@ yönetebilir (polkit kuralı kurulur). Kurulum betiği sizi bu gruba ekler.
 | `recheck_interval` | `1800` | Düzenli denetim aralığı (saniye, 0 = kapalı) |
 | `extra_domains` | `[]` | Elle eklenen alan adları |
 | `gui_autostart` | `true` | Oturum açılışında arayüzü başlat |
+| `latency_mode` | `false` | Ölçümlü düşük gecikme optimizasyonu |
 | `vodafone_mode` | `false` | Vodafone sınırsız modu (hotspot TTL düzeltmesi) |
 | `vodafone_networks` | `[]` | Modun etkin olacağı ağlar (en fazla 10) |
 | `vodafone_ttl` | `65` | Giden paketlere yazılacak TTL (ileri düzey) |
@@ -242,6 +282,7 @@ yönetebilir (polkit kuralı kurulur). Kurulum betiği sizi bu gruba ekler.
 - Linux, systemd
 - Python 3.8+
 - nftables (yoksa iptables)
+- iproute2/`tc` ve `iw` (Ping düşürme alt özellikleri; yoksa güvenle atlanır)
 - GTK 4 + libadwaita 1.2+ ve PyGObject (yalnızca arayüz için)
 - Servis root olarak çalışır (`CAP_NET_ADMIN`, `CAP_NET_RAW`)
 
@@ -272,6 +313,7 @@ src/dpibypass/
   dnsserver.py   yerel DNS köprüsü
   proxy.py       şeffaf TCP vekil
   firewall.py    nftables / iptables kuralları
+  latency.py     ölçüm, güvenli runtime optimizasyonu ve geri alma
   vodafone.py    hotspot TTL düzeltmesi (ayrı tabloda, eşik korumalı)
   netmon.py      netlink ağ değişikliği izleyicisi
   isps.py        operatör profilleri ve saptama

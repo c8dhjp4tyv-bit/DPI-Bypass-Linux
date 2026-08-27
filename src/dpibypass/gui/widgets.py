@@ -20,10 +20,17 @@ HAS_ALERT_DIALOG = hasattr(Adw, "AlertDialog")
 
 
 def switch_row(title: str, subtitle: str = "", active: bool = False,
-               on_change: Callable[[bool], None] | None = None):
+               on_change: Callable[[bool], None] | None = None,
+               badge: str = ""):
     """Anahtarlı satır (Adw.SwitchRow ya da eşdeğeri)."""
+    badge_label = None
+    if badge:
+        badge_label = Gtk.Label(label=badge, valign=Gtk.Align.CENTER)
+        badge_label.add_css_class("beta-badge")
     if HAS_SWITCH_ROW:
         row = Adw.SwitchRow(title=title, subtitle=subtitle, active=active)
+        if badge_label is not None:
+            row.add_suffix(badge_label)
         if on_change:
             row.connect("notify::active",
                         lambda r, _p: on_change(r.get_active()))
@@ -31,6 +38,8 @@ def switch_row(title: str, subtitle: str = "", active: bool = False,
 
     row = Adw.ActionRow(title=title, subtitle=subtitle)
     switch = Gtk.Switch(active=active, valign=Gtk.Align.CENTER)
+    if badge_label is not None:
+        row.add_suffix(badge_label)
     if on_change:
         switch.connect("notify::active",
                        lambda s, _p: on_change(s.get_active()))

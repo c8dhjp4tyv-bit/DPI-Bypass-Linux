@@ -126,14 +126,22 @@ class MainWindow(Adw.ApplicationWindow):
                       margin_top=28, margin_bottom=28,
                       margin_start=12, margin_end=12)
 
-        self.status_icon = Gtk.Image(icon_name=APP_ID, pixel_size=96)
+        self.status_icon = Gtk.Image(icon_name=APP_ID, pixel_size=112)
+        self.status_icon.set_size_request(112, 112)
+        self.status_icon.set_halign(Gtk.Align.CENTER)
+        self.status_icon.set_valign(Gtk.Align.CENTER)
         self.status_icon.add_css_class("dpi-status-icon")
-        self.status_spinner = Gtk.Spinner(width_request=96, height_request=96)
+        self.status_spinner = Gtk.Spinner(width_request=112, height_request=112,
+                                         halign=Gtk.Align.CENTER,
+                                         valign=Gtk.Align.CENTER)
         self.status_spinner.set_visible(False)
-        icon_box = Gtk.Box(halign=Gtk.Align.CENTER)
-        icon_box.append(self.status_icon)
-        icon_box.append(self.status_spinner)
-        box.append(icon_box)
+        # İkon ve spinner aynı kare allocation'ı paylaşır. Böylece pencere
+        # daraldığında uygulama logosu yatay/dikey sıkıştırılmaz.
+        icon_overlay = Gtk.Overlay(width_request=112, height_request=112,
+                                   halign=Gtk.Align.CENTER)
+        icon_overlay.set_child(self.status_icon)
+        icon_overlay.add_overlay(self.status_spinner)
+        box.append(icon_overlay)
 
         self.status_title = Gtk.Label(label="Bağlanılıyor…", halign=Gtk.Align.CENTER)
         self.status_title.add_css_class("title-1")
@@ -264,6 +272,18 @@ class MainWindow(Adw.ApplicationWindow):
         page.add(dns_group)
 
         advanced = Adw.PreferencesGroup(title="Gelişmiş")
+        self.row_latency, _ = switch_row(
+            "Ping düşürme",
+            "Aktif ağdaki güvenli düşük-gecikme optimizasyonlarını ölçerek "
+            "uygular; fayda sağlamayan değişiklikleri geri alır.",
+            False, lambda v: self._set_config(latency_mode=v), badge="BETA")
+        advanced.add(self.row_latency)
+
+        self.row_latency_info = Adw.ActionRow(
+            title="Gecikme durumu", subtitle="kapalı")
+        self.row_latency_info.add_css_class("property")
+        advanced.add(self.row_latency_info)
+
         self.row_vodafone, _ = switch_row(
             "Vodafone sınırsız modu",
             "Telefon paylaşımında 15 GB hotspot sınırını devre dışı bırakır. "
@@ -398,6 +418,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.row_gui_autostart.set_active(bool(self.config.get("gui_autostart", True)))
         self.row_dns_intercept.set_active(bool(self.config.get("dns_intercept", True)))
         self.row_quic.set_active(bool(self.config.get("block_quic", True)))
+        self.row_latency.set_active(bool(self.config.get("latency_mode", False)))
         self.row_verbose.set_active(bool(self.config.get("verbose", False)))
         if not self._vodafone_busy:
             self.row_vodafone.set_active(bool(self.config.get("vodafone_mode",
@@ -567,6 +588,18 @@ class MainWindow(Adw.ApplicationWindow):
         else:
             self.row_vodafone_info.set_subtitle("beklemede — kural uygulanmadı")
 
+    def _refresh_latency(self, latency: dict) -> None:
+        """Gerçek daemon ölçümünü göster; ölçülmemiş kazanç üretme."""
+        previous = self._loading
+        self._loading = True
+        self.row_latency.set_active(bool(latency.get("enabled")))
+        self._loading = previous
+        message_text = latency.get("message") or "kapalı"
+        applied = latency.get("applied") or []
+        if latency.get("active") and applied:
+            message_text += " · " + ", ".join(applied)
+        self.row_latency_info.set_subtitle(message_text)
+
     def _set_config(self, **values) -> None:
         if self._loading:
             return
@@ -662,6 +695,7 @@ class MainWindow(Adw.ApplicationWindow):
             f"çalışma süresi {self._fmt_uptime(data.get('uptime', 0))}")
 
         self._refresh_vodafone(data.get("vodafone") or {})
+        self._refresh_latency(data.get("latency") or {})
         self._refresh_results(data.get("last_results", []))
         self._refresh_learned(data.get("learned_domains", []))
 

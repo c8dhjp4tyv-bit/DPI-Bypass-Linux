@@ -27,6 +27,7 @@ from .desync import capabilities
 from .dnsserver import DnsServer
 from .firewall import Firewall, FirewallError
 from .ipc import IpcServer
+from .latency import LatencyError, LatencyOptimizer
 from .netmon import NetworkFingerprint, NetworkMonitor, fingerprint
 from .proxy import TransparentProxy
 from .resolver import shared as dns_resolver
@@ -56,6 +57,7 @@ class Daemon:
         self.tester = Tester(self.resolver)
         self.firewall = Firewall(PROXY_PORT, DNS_PORT)
         self.vodafone = self._make_vodafone()
+        self.latency = LatencyOptimizer()
         self.proxy = TransparentProxy(
             PROXY_PORT, self._current_strategy, self._should_bypass, self._on_result
         )
@@ -78,8 +80,10 @@ class Daemon:
         # Eşzamanlılık nesneleri, olay döngüsü başladıktan sonra kurulur
         # (eski Python sürümlerinde döngüye erken bağlanmamaları için).
         self._search_lock: asyncio.Lock = None  # type: ignore[assignment]
+        self._latency_control_lock: asyncio.Lock = None  # type: ignore[assignment]
         self._probe_semaphore: asyncio.Semaphore = None  # type: ignore[assignment]
         self._search_task: Optional[asyncio.Task] = None
+        self._latency_task: Optional[asyncio.Task] = None
         self._tasks: list[asyncio.Task] = []
         self._fail_counter: collections.Counter = collections.Counter()
         self._strategy_failures = 0
@@ -104,9 +108,11 @@ class Daemon:
                  "kullanılabilir" if caps.get("rawfake") else "kullanılamaz")
 
         self._search_lock = asyncio.Lock()
+        self._latency_control_lock = asyncio.Lock()
         self._probe_semaphore = asyncio.Semaphore(2)
         self.resolver.set_preferred(self.config["dns_provider"])
         await self.ipc.start()
+        await self.latency.recover()
 
         loop = asyncio.get_running_loop()
         stop_event = asyncio.Event()
@@ -121,6 +127,8 @@ class Daemon:
             await self.netmon.start()
             self.network = self.netmon.current
             self._apply_vodafone()
+            if self.config["latency_mode"]:
+                await self._restart_latency(self.network)
             self._tasks.append(asyncio.ensure_future(self._periodic_recheck()))
             self.trigger_search("servis başlangıcı")
             await stop_event.wait()
@@ -196,6 +204,7 @@ class Daemon:
             task.cancel()
         if self._search_task and not self._search_task.done():
             self._search_task.cancel()
+        await self._stop_latency()
         await self.netmon.stop()
         await self.proxy.stop()
         await self.dns_server.stop()
@@ -418,10 +427,48 @@ class Daemon:
     # ------------------------------------------------------------------ #
     # ağ değişikliği ve düzenli denetim
     # ------------------------------------------------------------------ #
+    async def _restart_latency(self, fp: NetworkFingerprint) -> None:
+        """Eski arayüzü geri alıp yeni ağ için tek bir ölçüm işi başlat."""
+        async with self._latency_control_lock:
+            current = self._latency_task
+            if current is not None and not current.done():
+                self.latency.request_cancel()
+                try:
+                    await current
+                except asyncio.CancelledError:
+                    pass
+            if self.latency.snapshot is not None:
+                if not await self.latency.disable():
+                    log.error("Eski ağın gecikme ayarları geri alınamadı; "
+                              "yeni ağa optimizasyon uygulanmayacak")
+                    return
+            if not self.config["latency_mode"]:
+                return
+            self._latency_task = asyncio.ensure_future(self.latency.optimize(fp))
+
+    async def _stop_latency(self) -> bool:
+        """Devam eden ölçümü durdur ve uygulanmış bütün ayarları geri al."""
+        lock = self._latency_control_lock
+        if lock is None:  # yalnız kısmi test örnekleri için
+            return await self.latency.disable()
+        async with lock:
+            current = self._latency_task
+            if current is not None and not current.done():
+                self.latency.request_cancel()
+                try:
+                    await current
+                except asyncio.CancelledError:
+                    pass
+            self._latency_task = None
+            return await self.latency.disable()
+
     async def _on_network_change(self, fp: NetworkFingerprint) -> None:
         self.network = fp
         self.resolver.clear_cache()
         self.tester._ip_cache.clear()
+        # Gecikme ayarları arayüze bağlıdır. Eski arayüzdeki runtime değişiklik
+        # tamamen geri alınmadan yenisi için ölçüm/apply işi başlamaz.
+        await self._restart_latency(fp)
         # TTL düzeltmesi ağa bağlıdır: yeni ağ kayıtlı değilse kendiliğinden
         # kalkar, kayıtlıysa yeni arayüz için yeniden kurulur.
         self._apply_vodafone()
@@ -476,6 +523,7 @@ class Daemon:
             "link": self.link.to_dict(),
             "network": self.network.to_dict(),
             "firewall": self.firewall.status(),
+            "latency": self._latency_status(),
             "vodafone": self._vodafone_status(),
             "proxy": dict(self.proxy.stats),
             "dns": {
@@ -501,6 +549,12 @@ class Daemon:
             "networks": self.config.vodafone_networks(),
         }
 
+    def _latency_status(self) -> dict:
+        """Runtime durumuna kalıcı kullanıcı seçimini ekle."""
+        data = self.latency.status_dict()
+        data["enabled"] = bool(self.config["latency_mode"])
+        return data
+
     async def _on_command(self, request: dict) -> dict:
         cmd = str(request.get("cmd", ""))
         try:
@@ -515,6 +569,12 @@ class Daemon:
 
             if cmd == "config.set":
                 values = request.get("values") or {}
+                if not isinstance(values, dict):
+                    return {"ok": False, "error": "values bir nesne olmalı"}
+                if "latency_mode" in values and not isinstance(
+                        values["latency_mode"], bool):
+                    return {"ok": False,
+                            "error": "latency_mode true/false olmalı"}
                 changed = self.config.update(values)
                 await self._apply_config_change(changed)
                 return {"ok": True, "data": {"changed": changed,
@@ -546,6 +606,32 @@ class Daemon:
                     return {"ok": False, "error": f"bilinmeyen yöntem: {name}"}
                 result = await self.tester.probe(strategy)
                 return {"ok": True, "data": result.to_dict()}
+
+            if cmd == "latency.status":
+                return {"ok": True, "data": self._latency_status()}
+
+            if cmd == "latency.enable":
+                changed = self.config.update({"latency_mode": True})
+                await self._apply_config_change(changed)
+                if not changed:
+                    self.network = fingerprint()
+                    await self._restart_latency(self.network)
+                return {"ok": True, "data": self._latency_status()}
+
+            if cmd == "latency.disable":
+                self.config.update({"latency_mode": False})
+                if not await self._stop_latency():
+                    return {"ok": False,
+                            "error": "Gecikme ayarlarının tamamı geri alınamadı"}
+                return {"ok": True, "data": self._latency_status()}
+
+            if cmd == "latency.test":
+                self.network = fingerprint()
+                try:
+                    measured = await self.latency.measure_only(self.network)
+                except LatencyError as exc:
+                    return {"ok": False, "error": str(exc)}
+                return {"ok": True, "data": measured.to_dict()}
 
             if cmd == "logs":
                 since = float(request.get("since") or 0)
@@ -622,6 +708,13 @@ class Daemon:
                 # Yapılandırma dosyası da gerçeği göstersin.
                 self.config.update({"vodafone_ttl": self.vodafone.ttl})
 
+        if "latency_mode" in changed:
+            if self.config["latency_mode"]:
+                self.network = fingerprint()
+                await self._restart_latency(self.network)
+            else:
+                await self._stop_latency()
+
         if "enabled" in changed:
             if self.config["enabled"]:
                 await self._start_network_services()
@@ -675,6 +768,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.cleanup:
         Firewall().clear()
         VodafoneMode().clear()
+        if not LatencyOptimizer().restore_persisted_sync():
+            log.error("Gecikme ayarlarının tamamı geri alınamadı.")
+            return 1
         log.info("Kurallar temizlendi.")
         return 0
 

@@ -75,6 +75,9 @@ def cmd_status(client: IpcClient, args) -> int:
     vodafone = data.get("vodafone")
     if vodafone:
         print(f"  Vodafone modu : {_vodafone_line(vodafone)}")
+    latency = data.get("latency")
+    if latency:
+        print(f"  Ping düşürme  : {_latency_line(latency)}")
     return 0
 
 
@@ -91,6 +94,36 @@ def _vodafone_line(vodafone: dict) -> str:
         return _color("beklemede", YELLOW) + \
             f" — bu ağ kayıtlı değil ({vodafone.get('network', '-')})"
     return _color("beklemede", YELLOW) + " — kural uygulanmadı"
+
+
+def _latency_line(latency: dict) -> str:
+    if not latency.get("enabled"):
+        return _color("kapalı", DIM)
+    if latency.get("active"):
+        return _color("doğrulandı", GREEN) + f" — {latency.get('message', '')}"
+    if latency.get("state") in ("measuring", "applying", "verifying"):
+        return _color("ölçülüyor", YELLOW) + f" — {latency.get('message', '')}"
+    return f"{latency.get('message', latency.get('state', '—'))}"
+
+
+def _print_measurement(measurement: dict, indent: str = "  ") -> None:
+    remote = measurement.get("remote") or {}
+    gateway = measurement.get("gateway") or {}
+    print(f"{indent}Yöntem : {measurement.get('method', '-')}")
+    if remote.get("median_ms") is not None:
+        print(f"{indent}Uzak    : median {remote['median_ms']:g} ms · "
+              f"min {remote['minimum_ms']:g} ms · p95 {remote['p95_ms']:g} ms · "
+              f"jitter {remote['jitter_ms']:g} ms · "
+              f"%{remote['packet_loss']:g} kayıp")
+    else:
+        print(f"{indent}Uzak    : ölçülemedi")
+    if gateway.get("median_ms") is not None:
+        print(f"{indent}Ağ geçidi: median {gateway['median_ms']:g} ms · "
+              f"p95 {gateway['p95_ms']:g} ms · "
+              f"jitter {gateway['jitter_ms']:g} ms · "
+              f"%{gateway['packet_loss']:g} kayıp")
+    else:
+        print(f"{indent}Ağ geçidi: ölçülemedi")
 
 
 def cmd_search(client: IpcClient, args) -> int:
@@ -259,6 +292,56 @@ def cmd_vodafone(client: IpcClient, args) -> int:
     return 0
 
 
+def cmd_latency(client: IpcClient, args) -> int:
+    """Ölçümlü düşük gecikme kipini yönet."""
+    if args.action == "test":
+        response = client.call("latency.test")
+        if not response.get("ok"):
+            return _fail(response)
+        print(f"{BOLD}Gecikme ölçümü{RESET}")
+        _print_measurement(response["data"])
+        return 0
+
+    if args.action == "on":
+        response = client.call("latency.enable")
+        if not response.get("ok"):
+            return _fail(response)
+        print("Ping düşürme açıldı; önce/sonra ölçümü yapılıyor…")
+        for _index in range(45):
+            time.sleep(1)
+            response = client.call("latency.status")
+            if not response.get("ok"):
+                return _fail(response)
+            if response["data"].get("state") not in (
+                    "measuring", "applying", "verifying"):
+                break
+    elif args.action == "off":
+        response = client.call("latency.disable")
+        if not response.get("ok"):
+            return _fail(response)
+        print("Ping düşürme kapatıldı; değişiklikler geri alındı.")
+    else:
+        response = client.call("latency.status")
+        if not response.get("ok"):
+            return _fail(response)
+
+    data = response["data"]
+    print(f"{BOLD}Ping düşürme (Beta){RESET}")
+    print(f"  Durum   : {_latency_line(data)}")
+    print(f"  Arayüz  : {data.get('interface') or '-'}")
+    if data.get("applied"):
+        print("  Uygulanan: " + ", ".join(data["applied"]))
+    if data.get("skipped"):
+        print("  Atlanan : " + "; ".join(data["skipped"]))
+    if data.get("before"):
+        print("  Önce:")
+        _print_measurement(data["before"], "    ")
+    if data.get("after"):
+        print("  Sonra:")
+        _print_measurement(data["after"], "    ")
+    return 0
+
+
 def cmd_config(client: IpcClient, args) -> int:
     response = client.call("config.get")
     if not response.get("ok"):
@@ -308,6 +391,12 @@ def main(argv: list[str] | None = None) -> int:
     p_vodafone.add_argument("action", choices=("status", "on", "off"),
                             nargs="?", default="status")
     p_vodafone.set_defaults(func=cmd_vodafone)
+
+    p_latency = sub.add_parser(
+        "latency", help="ölçümlü düşük gecikme optimizasyonu (Beta)")
+    p_latency.add_argument("action", choices=("status", "on", "off", "test"),
+                           nargs="?", default="status")
+    p_latency.set_defaults(func=cmd_latency)
 
     args = parser.parse_args(argv)
     if not getattr(args, "func", None):

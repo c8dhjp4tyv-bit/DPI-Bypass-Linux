@@ -2,6 +2,19 @@
 
 .dpi-status-icon {
   margin-bottom: 6px;
+  min-width: 112px;
+  min-height: 112px;
+}
+
+.beta-badge {
+  min-height: 16px;
+  padding: 1px 7px;
+  margin-right: 6px;
+  border-radius: 999px;
+  background-color: alpha(@accent_color, 0.16);
+  color: @accent_color;
+  font-size: 0.72em;
+  font-weight: 700;
 }
 
 .dpi-ok {

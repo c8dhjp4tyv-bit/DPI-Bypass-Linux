@@ -20,7 +20,7 @@
       <li>Operatörü (Türk Telekom, Turkcell, Vodafone, TurkNet…) otomatik saptar</li>
       <li>Yöntemi discord.com üzerinde gerçekten sınayarak seçer</li>
       <li>Yeni bir ağa geçildiğinde saniyeler içinde yeniden ayarlanır</li>
-      <li>VPN değildir: trafik dışarı çıkmaz, ping ve gecikme etkilenmez</li>
+      <li>VPN değildir; isteğe bağlı Ping düşürme kipi yerel gecikmeyi ölçerek iyileştirir</li>
       <li>Sistem açılışında başlayan bir systemd servisi olarak çalışır</li>
     </ul>
   </description>
@@ -56,6 +56,17 @@
   </requires>
 
   <releases>
+    <release version="1.2.0" date="2026-08-27">
+      <description>
+        <p>Ölçümlü Ping düşürme (Beta) kipi eklendi.</p>
+        <ul>
+          <li>Wi-Fi güç tasarrufu ve güvenle geri alınabilen basit FIFO qdisc'ler değerlendirilir.</li>
+          <li>Median, p95, jitter ve paket kaybı önce/sonra ölçülür; doğrulanmayan değişiklikler geri alınır.</li>
+          <li>Ağ değişiminde, servis kapanışında ve crash cleanup yolunda eski ayarlar geri yüklenir.</li>
+          <li>Ana sayfa logosunun kare oranı ve Gelişmiş ayarlar arayüzü iyileştirildi.</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.1.0" date="2026-07-29">
       <description>
         <p>Vodafone sınırsız modu eklendi.</p>
