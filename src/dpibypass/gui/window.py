@@ -8,7 +8,7 @@ import time
 
 from gi.repository import Adw, Gio, GLib, Gtk
 
-from ..constants import SOCKET_GROUP
+from .. import session_access
 from ..util import run, which
 from ..version import APP_ID, APP_NAME, AUTHOR, WEBSITE, __version__
 from ..vodafone import helper_path
@@ -38,6 +38,9 @@ STATUS_VIEW = {
 
 
 class MainWindow(Adw.ApplicationWindow):
+    #: Yetkilendirme penceresi açıkken durum yenilemesi banner'ı ezmesin.
+    _repair_busy = False
+
     def __init__(self, app: Adw.Application) -> None:
         super().__init__(application=app, title=APP_NAME)
         self.set_default_size(880, 720)
@@ -50,6 +53,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.isp_list: list[dict] = []
         self._loading = True
         self._vodafone_busy = False
+        self._repair_busy = False
         self._log_since = 0.0
         self._log_lines: list[str] = []
 
@@ -274,8 +278,8 @@ class MainWindow(Adw.ApplicationWindow):
         advanced = Adw.PreferencesGroup(title="Gelişmiş")
         self.row_latency, _ = switch_row(
             "Ping düşürme",
-            "Aktif ağdaki güvenli düşük-gecikme optimizasyonlarını ölçerek "
-            "uygular; fayda sağlamayan değişiklikleri geri alır.",
+            "Aktif ağdaki güvenli düşük-gecikme adaylarını tek tek ölçer, "
+            "yalnızca doğrulanmış kazancı olanı bırakır, gerisini geri alır.",
             False, lambda v: self._set_config(latency_mode=v), badge="BETA")
         advanced.add(self.row_latency)
 
@@ -283,6 +287,23 @@ class MainWindow(Adw.ApplicationWindow):
             title="Gecikme durumu", subtitle="kapalı")
         self.row_latency_info.add_css_class("property")
         advanced.add(self.row_latency_info)
+
+        # Ölçüm sonuçları: yalnızca gerçek veri varken görünür. Ölçülmemiş
+        # hiçbir kazanç burada gösterilmez.
+        self.latency_detail_rows: dict[str, Adw.ActionRow] = {}
+        for key, title in (
+            ("before", "Önce"),
+            ("after", "Sonra"),
+            ("gain", "Kazanç"),
+            ("applied", "Uygulanan"),
+            ("candidates", "Denenen adaylar"),
+            ("skipped", "Atlananlar"),
+        ):
+            row = Adw.ActionRow(title=title, subtitle="—")
+            row.add_css_class("property")
+            row.set_visible(False)
+            advanced.add(row)
+            self.latency_detail_rows[key] = row
 
         self.row_vodafone, _ = switch_row(
             "Vodafone sınırsız modu",
@@ -589,16 +610,85 @@ class MainWindow(Adw.ApplicationWindow):
             self.row_vodafone_info.set_subtitle("beklemede — kural uygulanmadı")
 
     def _refresh_latency(self, latency: dict) -> None:
-        """Gerçek daemon ölçümünü göster; ölçülmemiş kazanç üretme."""
+        """Gerçek daemon ölçümünü göster; ölçülmemiş kazanç üretme.
+
+        Kazanç yalnızca servis onu ölçüp doğruladıysa yazılır. Doğrulanmış
+        bir iyileştirme yoksa bu açıkça söylenir; sahte "optimize edildi"
+        durumu gösterilmez.
+        """
         previous = self._loading
         self._loading = True
         self.row_latency.set_active(bool(latency.get("enabled")))
         self._loading = previous
-        message_text = latency.get("message") or "kapalı"
-        applied = latency.get("applied") or []
-        if latency.get("active") and applied:
-            message_text += " · " + ", ".join(applied)
-        self.row_latency_info.set_subtitle(message_text)
+
+        state = latency.get("state") or "disabled"
+        # Sonuç yalnızca durum gerçekten 'active' iken gösterilir. Geri alma
+        # başarısız olduğunda 'active' bayrağı hâlâ True'dur ama bu bir kazanç
+        # değil, bildirilmesi gereken bir hatadır.
+        active = state == "active" and bool(latency.get("active"))
+        if not latency.get("enabled") and state == "disabled":
+            summary = "kapalı"
+        elif state in ("measuring", "applying", "benchmarking", "verifying"):
+            summary = latency.get("message") or "ölçülüyor…"
+        elif state == "no-gain":
+            summary = "Bu ağda doğrulanmış bir gecikme iyileştirmesi bulunamadı."
+        else:
+            summary = latency.get("message") or "—"
+        self.row_latency_info.set_subtitle(summary)
+
+        before = (latency.get("before") or {}).get("remote") or {}
+        after = (latency.get("after") or {}).get("remote") or {}
+        gain = latency.get("gain") or {}
+        rows = self.latency_detail_rows
+        self._set_detail(rows["before"], self._fmt_remote(before))
+        # "Sonra" ve "Kazanç" yalnızca doğrulanmış ve yürürlükteki bir sonuç
+        # varken anlamlıdır; geri alınmış bir denemenin ölçümü kazanç değildir.
+        self._set_detail(rows["after"], self._fmt_remote(after) if active else "")
+        self._set_detail(rows["gain"], self._fmt_gain(gain) if active else "")
+        self._set_detail(
+            rows["applied"],
+            ", ".join(latency.get("applied") or []) if active else "")
+        self._set_detail(rows["candidates"],
+                         self._fmt_candidates(latency.get("candidates") or []))
+        self._set_detail(rows["skipped"], "; ".join(latency.get("skipped") or []))
+
+    @staticmethod
+    def _set_detail(row, text: str) -> None:
+        row.set_visible(bool(text))
+        if text:
+            row.set_subtitle(text)
+
+    @staticmethod
+    def _fmt_remote(stats: dict) -> str:
+        if not stats or stats.get("median_ms") is None:
+            return ""
+        parts = [f"{stats['median_ms']:g} ms median"]
+        if stats.get("p95_ms") is not None:
+            parts.append(f"{stats['p95_ms']:g} ms p95")
+        if stats.get("jitter_ms") is not None:
+            parts.append(f"{stats['jitter_ms']:g} ms jitter")
+        parts.append(f"%{stats.get('packet_loss', 0):g} kayıp")
+        return " · ".join(parts)
+
+    @staticmethod
+    def _fmt_gain(gain: dict) -> str:
+        labels = (("median_ms", "median"), ("p95_ms", "p95"),
+                  ("jitter_ms", "jitter"))
+        parts = []
+        for key, label in labels:
+            value = gain.get(key)
+            if value is None:
+                continue
+            parts.append(f"{value:+g} ms {label}")
+        return " · ".join(parts)
+
+    @staticmethod
+    def _fmt_candidates(candidates: list) -> str:
+        parts = []
+        for item in candidates:
+            mark = "✓" if item.get("verified") else "✕"
+            parts.append(f"{mark} {item.get('label', item.get('key', '?'))}")
+        return " · ".join(parts)
 
     def _set_config(self, **values) -> None:
         if self._loading:
@@ -704,18 +794,98 @@ class MainWindow(Adw.ApplicationWindow):
         self.status_spinner.set_visible(False)
         self.status_icon.set_visible(True)
         self.status_title.set_label(title)
-        self.status_subtitle.set_label(response.get("error", ""))
-        if response.get("code") == "permission":
+
+        if self._repair_busy:
+            # Yetki penceresi açıkken banner'ı her tick'te ezme.
+            return
+
+        # Her erişim hatasını "gruba eklenmediniz" diye göstermek yanlış:
+        # grup, oturum grup listesi, servis ve soket izinleri ayrı sorunlardır.
+        try:
+            report = session_access.analyze()
+        except Exception as exc:      # tanı başarısızsa genel mesaja düş
+            self.status_subtitle.set_label(response.get("error", ""))
             self.banner.show_message(
-                f"Denetim soketine erişemiyorsunuz. Kullanıcınızı '{SOCKET_GROUP}' "
-                "grubuna ekleyip oturumu yeniden açın.",
-                "Komutu kopyala",
-                lambda: self._copy(
-                    f"sudo usermod -aG {SOCKET_GROUP} $USER"))
+                f"Servise bağlanılamadı ve erişim tanısı yapılamadı: {exc}",
+                "Servisi başlat", self.restart_service)
+            return
+        self.status_subtitle.set_label(report.detail or response.get("error", ""))
+
+        if report.state == session_access.STATE_STALE_SESSION:
+            # Kullanıcı gerçekten grupta; eksik olan yalnızca bu oturumun grup
+            # listesi. Uygulama kendini doğru grup bağlamında başlatabilir.
+            self.banner.show_message(
+                f"{report.detail} Uygulamayı doğru grup bağlamında yeniden "
+                "başlatmak sorunu çözer.",
+                "Uygulamayı yeniden başlat", self._reexec_with_group)
+        elif report.state in (session_access.STATE_NOT_MEMBER,
+                              session_access.STATE_GROUP_MISSING):
+            if session_access.access_helper_path() and which("pkexec"):
+                self.banner.show_message(
+                    f"{report.detail} Yönetici onayıyla düzeltilebilir.",
+                    "Erişimi onar", self._repair_access)
+            else:
+                self.banner.show_message(
+                    f"{report.detail} Terminalden: {report.remedy}",
+                    "Komutu kopyala", lambda: self._copy(report.remedy))
+        elif report.state == session_access.STATE_SOCKET_PERMISSIONS:
+            self.banner.show_message(
+                f"{report.detail}", "Servisi yeniden başlat",
+                self.restart_service)
+        elif report.state == session_access.STATE_DENIED:
+            self.banner.show_message(report.detail, "Ayrıntıyı kopyala",
+                                     lambda: self._copy(report.remedy))
         else:
             self.banner.show_message(
                 "Arka plan servisi çalışmıyor.",
                 "Servisi başlat", self.restart_service)
+
+    # -- erişim onarımı ----------------------------------------------------
+    def _reexec_with_group(self) -> None:
+        """Süreci ``sg dpi-bypass -c …`` ile yeniden başlat."""
+        report = session_access.maybe_reexec_with_group()
+        # Buraya dönülüyorsa execvp gerçekleşmemiştir.
+        message(self, "Yeniden başlatılamadı",
+                f"{report.detail}\n\n{report.remedy}")
+
+    def _repair_access(self) -> None:
+        helper = session_access.access_helper_path()
+        if helper is None:
+            self.toast("Erişim onarım yardımcısı bulunamadı; kurulum eksik.")
+            return
+        if which("pkexec") is None:
+            self.toast("pkexec bulunamadı; polkit paketi kurulu değil.")
+            return
+        self._repair_busy = True
+        self.banner.show_message("Yönetici onayı bekleniyor…")
+        threading.Thread(target=self._repair_worker, args=(helper,),
+                         daemon=True).start()
+
+    def _repair_worker(self, helper: str) -> None:
+        try:
+            result = run(["pkexec", helper], timeout=300)
+            code, error = result.returncode, (result.stderr or "").strip()
+        except Exception as exc:
+            code, error = 1, str(exc)
+        idle(self._on_repair_done, code, error)
+
+    def _on_repair_done(self, code: int, stderr: str) -> None:
+        self._repair_busy = False
+        if code in (126, 127):
+            self.toast("İşlem iptal edildi (yetki verilmedi)")
+            return
+        if code != 0:
+            message(self, "Erişim onarılamadı",
+                    stderr or "Yardımcı beklenmeyen bir hata verdi.")
+            return
+        # Grup veritabanı düzeldi; bu oturum hâlâ eski grup listesinde.
+        report = session_access.analyze()
+        if report.can_reexec:
+            self._reexec_with_group()
+            return
+        message(self, "Erişim onarıldı",
+                "Kullanıcınız artık gruba ekli. Değişikliğin bu oturumdaki "
+                "tüm programlara yansıması için oturumu kapatıp açın.")
 
     def _refresh_results(self, results: list[dict]) -> None:
         for row in self._result_rows:

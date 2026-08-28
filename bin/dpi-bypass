@@ -20,6 +20,29 @@ def _add_package_path() -> None:
 
 _add_package_path()
 
+
+def _ensure_socket_group() -> None:
+    """Terminal oturumu da eski grup listesiyle çalışıyor olabilir.
+
+    Arayüzle aynı mantık: kullanıcı grup veritabanında üyeyse ama bu süreç
+    grubu almamışsa komut bir kez 'sg' ile yeniden çalıştırılır. 'doctor'
+    komutu tanı içindir; onu asla yeniden başlatma, aksi halde kullanıcı
+    sorunun kendisini göremez.
+    """
+    if len(sys.argv) > 1 and sys.argv[1] == "doctor":
+        return
+    try:
+        from dpibypass import session_access
+    except ImportError:
+        return
+    try:
+        session_access.maybe_reexec_with_group(argv=sys.argv)
+    except Exception:
+        pass
+
+
+_ensure_socket_group()
+
 from dpibypass.cli import main  # noqa: E402
 
 if __name__ == "__main__":

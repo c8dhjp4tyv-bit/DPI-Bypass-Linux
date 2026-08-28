@@ -24,33 +24,19 @@ _add_package_path()
 def _ensure_socket_group() -> None:
     """Kullanıcı 'dpi-bypass' grubuna yeni eklendiyse oturumu kapatmadan uygula.
 
-    usermod ile eklenen grup, açık oturumdaki süreçlere yansımaz. Grup
-    üyeliği /etc/group içinde varsa ama süreç grupları arasında yoksa,
-    uygulama bir kez 'sg' ile yeniden başlatılır.
+    usermod ile eklenen grup açık oturumdaki süreçlere yansımaz. Tanıyı
+    dpibypass.session_access yapar; yalnızca "kullanıcı grup veritabanında
+    üye ama bu süreç grubu almamış" durumunda uygulama bir kez 'sg' ile
+    yeniden başlatılır. Diğer durumlarda (grup yok, üye değil, servis yok,
+    soket izni bozuk) pencere açılır ve doğru tanı orada gösterilir.
     """
-    if os.environ.get("DPI_BYPASS_SG"):
-        return
-    socket_path = "/run/dpi-bypass/daemon.sock"
-    if not os.path.exists(socket_path) or os.access(socket_path, os.R_OK | os.W_OK):
+    try:
+        from dpibypass import session_access
+    except ImportError:
         return
     try:
-        import grp
-        import pwd
-
-        group = grp.getgrnam("dpi-bypass")
-        user = pwd.getpwuid(os.getuid()).pw_name
-    except (ImportError, KeyError):
-        return
-    if group.gr_gid in os.getgroups() or user not in group.gr_mem:
-        return
-    if not any(os.access(os.path.join(p, "sg"), os.X_OK)
-               for p in os.environ.get("PATH", "/usr/bin").split(":")):
-        return
-    os.environ["DPI_BYPASS_SG"] = "1"
-    command = " ".join(f"'{a}'" for a in [os.path.realpath(__file__)] + sys.argv[1:])
-    try:
-        os.execvp("sg", ["sg", "dpi-bypass", "-c", command])
-    except OSError:
+        session_access.maybe_reexec_with_group(argv=sys.argv)
+    except Exception:      # tanı hiçbir koşulda uygulamayı engellememeli
         pass
 
 

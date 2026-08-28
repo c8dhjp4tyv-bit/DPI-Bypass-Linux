@@ -10,7 +10,7 @@ import json
 import sys
 import time
 
-from .constants import SOCKET_GROUP
+from . import session_access
 from .ipc import IpcClient
 from .util import is_root, run, which
 from .version import APP_NAME, AUTHOR, __version__
@@ -30,12 +30,58 @@ def _color(text: str, code: str) -> str:
 
 def _fail(response: dict) -> int:
     print(_color("Hata: ", RED) + str(response.get("error")))
+    if response.get("code") in ("permission", "no-service"):
+        # Gerçek sebebi tahmin etme: grup üyeliği, oturum grup listesi, servis
+        # ve soket izinleri farklı sorunlardır ve farklı çözümleri vardır.
+        report = session_access.analyze()
+        if not report.ok:
+            print(f"{DIM}{report.title}: {report.detail}{RESET}")
+            if report.remedy:
+                print(f"{DIM}Çözüm: {report.remedy}{RESET}")
+            print(f"{DIM}Ayrıntı: dpi-bypass doctor{RESET}")
+            return 1
     if response.get("code") == "no-service":
         print(f"{DIM}Servisi başlatın: sudo systemctl start dpi-bypass{RESET}")
-    elif response.get("code") == "permission":
-        print(f"{DIM}Kullanıcınızı gruba ekleyin: "
-              f"sudo usermod -aG {SOCKET_GROUP} $USER{RESET}")
     return 1
+
+
+def cmd_doctor(client: IpcClient, args) -> int:
+    """Denetim soketine erişimin neden çalışmadığını ayrıntılı gösterir."""
+    report = session_access.analyze()
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, ensure_ascii=False))
+        return 0 if report.ok else 1
+
+    print(f"{BOLD}DPI Bypass erişim tanısı{RESET}")
+    print(f"  Kullanıcı      : {report.user or '-'} (uid {report.uid})")
+    print(f"  Grup           : {report.group}"
+          + (f" (gid {report.group_gid})" if report.group_gid is not None
+             else _color(" — sistemde yok", RED)))
+    print("  Grup veritabanı: "
+          + (_color("üye", GREEN) if report.member_in_db
+             else _color("üye değil", RED)))
+    print("  Bu oturum      : "
+          + (_color("grup alınmış", GREEN) if report.member_in_process
+             else _color("grup alınmamış", YELLOW)))
+    socket_facts = report.socket
+    if socket_facts.exists:
+        print(f"  Soket          : {socket_facts.path} · "
+              f"uid {socket_facts.uid} · gid {socket_facts.gid}"
+              + (f" ({socket_facts.group_name})" if socket_facts.group_name else "")
+              + f" · kip 0{(socket_facts.mode or 0):o}")
+    else:
+        print(f"  Soket          : {_color('yok', RED)} ({socket_facts.path})")
+    print("  Sonuç          : "
+          + (_color(report.title, GREEN) if report.ok
+             else _color(report.title, RED)))
+    if report.detail:
+        print(f"  Açıklama       : {report.detail}")
+    if report.remedy and not report.ok:
+        print(f"  Çözüm          : {report.remedy}")
+    if report.can_reexec:
+        print(f"{DIM}Bu durum oturum kapatmadan düzelir: 'dpi-bypass' ya da "
+              f"arayüz kendini 'sg' ile yeniden başlatır.{RESET}")
+    return 0 if report.ok else 1
 
 
 def cmd_status(client: IpcClient, args) -> int:
@@ -96,14 +142,40 @@ def _vodafone_line(vodafone: dict) -> str:
     return _color("beklemede", YELLOW) + " — kural uygulanmadı"
 
 
+#: Ölçüm/aday taraması sürerken görülen durumlar.
+LATENCY_BUSY_STATES = ("measuring", "applying", "benchmarking", "verifying")
+
+
 def _latency_line(latency: dict) -> str:
+    state = latency.get("state")
+    if not latency.get("enabled") and state == "disabled":
+        return _color("kapalı", DIM)
+    # Hata durumları 'active' bayrağından ÖNCE gelir: geri alma başarısızsa
+    # 'active' hâlâ True'dur (değişiklik sistemde duruyor olabilir), ama bu
+    # "doğrulandı" demek değildir.
+    if state == "rollback-failed":
+        return _color("geri alınamadı", RED) + f" — {latency.get('message', '')}"
+    if state == "failed":
+        return _color("başarısız", RED) + f" — {latency.get('message', '')}"
     if not latency.get("enabled"):
         return _color("kapalı", DIM)
-    if latency.get("active"):
+    if state == "active" and latency.get("active"):
         return _color("doğrulandı", GREEN) + f" — {latency.get('message', '')}"
-    if latency.get("state") in ("measuring", "applying", "verifying"):
+    if latency.get("state") in LATENCY_BUSY_STATES:
         return _color("ölçülüyor", YELLOW) + f" — {latency.get('message', '')}"
+    if latency.get("state") == "no-gain":
+        return _color("kazanç yok", YELLOW) + f" — {latency.get('message', '')}"
     return f"{latency.get('message', latency.get('state', '—'))}"
+
+
+def _print_gain(gain: dict, indent: str = "  ") -> None:
+    """Yalnızca gerçekten ölçülmüş farkı yazar."""
+    labels = (("median_ms", "median"), ("p95_ms", "p95"),
+              ("jitter_ms", "jitter"), ("packet_loss", "kayıp"))
+    parts = [f"{gain[key]:+g} {label}" for key, label in labels
+             if gain.get(key) is not None]
+    if parts:
+        print(f"{indent}Kazanç : " + " · ".join(parts))
 
 
 def _print_measurement(measurement: dict, indent: str = "  ") -> None:
@@ -306,14 +378,14 @@ def cmd_latency(client: IpcClient, args) -> int:
         response = client.call("latency.enable")
         if not response.get("ok"):
             return _fail(response)
-        print("Ping düşürme açıldı; önce/sonra ölçümü yapılıyor…")
-        for _index in range(45):
+        print("Ping düşürme açıldı; adaylar tek tek ölçülüyor "
+              "(bu birkaç dakika sürebilir)…")
+        for _index in range(240):
             time.sleep(1)
             response = client.call("latency.status")
             if not response.get("ok"):
                 return _fail(response)
-            if response["data"].get("state") not in (
-                    "measuring", "applying", "verifying"):
+            if response["data"].get("state") not in LATENCY_BUSY_STATES:
                 break
     elif args.action == "off":
         response = client.call("latency.disable")
@@ -333,12 +405,19 @@ def cmd_latency(client: IpcClient, args) -> int:
         print("  Uygulanan: " + ", ".join(data["applied"]))
     if data.get("skipped"):
         print("  Atlanan : " + "; ".join(data["skipped"]))
+    for candidate in data.get("candidates") or []:
+        mark = _color("✓", GREEN) if candidate.get("verified") else _color("✕", DIM)
+        score = candidate.get("score")
+        print(f"  {mark} {candidate.get('label', candidate.get('key'))}"
+              + (f" · puan {score:g}" if score is not None else "")
+              + f" · {candidate.get('verdict', '')}")
     if data.get("before"):
         print("  Önce:")
         _print_measurement(data["before"], "    ")
-    if data.get("after"):
+    if data.get("after") and data.get("state") == "active":
         print("  Sonra:")
         _print_measurement(data["after"], "    ")
+        _print_gain(data.get("gain") or {}, "  ")
     return 0
 
 
@@ -377,6 +456,11 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("enable", help="korumayı aç").set_defaults(func=cmd_toggle)
     sub.add_parser("disable", help="korumayı kapat").set_defaults(func=cmd_toggle)
     sub.add_parser("config", help="ayarları göster").set_defaults(func=cmd_config)
+
+    p_doctor = sub.add_parser(
+        "doctor", help="denetim soketine erişim tanısı (grup/oturum/soket)")
+    p_doctor.add_argument("--json", action="store_true")
+    p_doctor.set_defaults(func=cmd_doctor)
 
     p_logs = sub.add_parser("logs", help="servis günlüğü")
     p_logs.add_argument("-f", "--follow", action="store_true")

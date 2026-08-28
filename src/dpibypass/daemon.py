@@ -112,6 +112,11 @@ class Daemon:
         self._probe_semaphore = asyncio.Semaphore(2)
         self.resolver.set_preferred(self.config["dns_provider"])
         await self.ipc.start()
+        if self.ipc.degraded:
+            # Soket beklenen grup/kip ile kurulamadı: GUI ve komut satırı
+            # bağlanamayacak. Sessizce herkese açmaktansa bunu yüksek sesle
+            # söyle; kullanıcı 'dpi-bypass doctor' ile aynı tanıyı görür.
+            log.error("Denetim soketi güvenli kipte: %s", self.ipc.degraded_reason)
         await self.latency.recover()
 
         loop = asyncio.get_running_loop()
@@ -523,6 +528,7 @@ class Daemon:
             "link": self.link.to_dict(),
             "network": self.network.to_dict(),
             "firewall": self.firewall.status(),
+            "socket": self.ipc.status(),
             "latency": self._latency_status(),
             "vodafone": self._vodafone_status(),
             "proxy": dict(self.proxy.stats),

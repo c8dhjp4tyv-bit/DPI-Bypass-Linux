@@ -15,6 +15,11 @@ LOG_DIR = "/var/log/dpi-bypass"
 LOG_FILE = os.path.join(LOG_DIR, "service.log")
 
 SOCKET_GROUP = "dpi-bypass"
+# Denetim soketinin beklenen kipi. Soket root daemon'ı yönetir; bu yüzden
+# yalnızca sahibi (root) ve 'dpi-bypass' grubu erişebilir. Grup çözülemezse
+# soket 0666 yapılmaz — güvenli varsayılan 0600'e düşmektir.
+SOCKET_MODE = 0o660
+SOCKET_MODE_DEGRADED = 0o600
 
 # --- Vodafone sınırsız kipi -------------------------------------------------
 # Vodafone modunda TTL yeniden yazımı yalnızca bu değerin ÜSTÜNDEKİ paketlere
@@ -38,9 +43,23 @@ VODAFONE_STATE_FILE = os.path.join(RUN_DIR, "vodafone.json")
 # servis çöküp systemd tarafından yeniden başlatılırsa önce bu tarif uygulanır.
 LATENCY_STATE_FILE = os.path.join(RUN_DIR, "latency.json")
 
-# pkexec ile çağrılan yetkilendirme yardımcısı (install.sh buraya kurar).
+# Ağ başına doğrulanmış en iyi aday. /run değil /var/lib altında: bu bilgi
+# yeniden başlatmalar arasında korunur ve her açılışta uzun benchmark
+# yapılmasını önler. Yalnızca "hangi adayı önce dene" bilgisidir; sistemde
+# kalıcı bir ağ ayarı bırakmaz.
+LATENCY_PROFILE_FILE = os.path.join(STATE_DIR, "latency-profiles.json")
+
+# pkexec ile çağrılan yetkilendirme yardımcıları (install.sh buraya kurar).
 VODAFONE_HELPER = "/usr/libexec/dpi-bypass/vodafone-helper"
 VODAFONE_ACTION = "xyz.atomland.DpiBypass.vodafone-mode"
+
+ACCESS_HELPER = "/usr/libexec/dpi-bypass/dpi-bypass-access-helper"
+ACCESS_ACTION = "xyz.atomland.DpiBypass.repair-access"
+#: Kaynak ağacından ya da /usr/local öneki ile kurulduğunda aranacak yerler.
+ACCESS_HELPER_FALLBACKS = (
+    ACCESS_HELPER,
+    "/usr/local/libexec/dpi-bypass/dpi-bypass-access-helper",
+)
 
 # --- ağ ---------------------------------------------------------------------
 # Kendi trafiğimizi yönlendirme kurallarından muaf tutmak için kullanılan işaret.
