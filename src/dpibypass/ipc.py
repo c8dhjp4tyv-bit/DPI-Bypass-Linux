@@ -12,9 +12,11 @@ import json
 import logging
 import os
 import socket
+import stat as stat_module
 from typing import Any, Awaitable, Callable
 
-from .constants import RUN_DIR, SOCKET_GROUP, SOCKET_PATH
+from .constants import (RUN_DIR, SOCKET_GROUP, SOCKET_MODE,
+                        SOCKET_MODE_DEGRADED, SOCKET_PATH)
 
 log = logging.getLogger("dpibypass.ipc")
 
@@ -22,9 +24,16 @@ Handler = Callable[[dict], Awaitable[dict]]
 
 
 class IpcServer:
-    def __init__(self, handler: Handler, path: str = SOCKET_PATH) -> None:
+    def __init__(self, handler: Handler, path: str = SOCKET_PATH,
+                 group: str = SOCKET_GROUP) -> None:
         self.handler = handler
         self.path = path
+        self.group = group
+        #: Soket beklenen grup/kip ile kurulabildi mi? Kurulamadıysa soket
+        #: yalnızca root'a açıktır ve GUI/CLI bunu bir servis sorunu olarak
+        #: bildirir — sessizce herkese açılmaz.
+        self.degraded = False
+        self.degraded_reason = ""
         self._server: asyncio.base_events.Server | None = None
 
     async def start(self) -> None:
@@ -33,24 +42,88 @@ class IpcServer:
             os.unlink(self.path)
         except FileNotFoundError:
             pass
-        self._server = await asyncio.start_unix_server(self._client, path=self.path)
+        # Soket, izinleri ayarlanana kadar bile geniş açılmasın: asyncio
+        # soketi umask'e göre oluşturur, bu yüzden önce dar bir umask kur.
+        previous_umask = os.umask(0o177)
+        try:
+            self._server = await asyncio.start_unix_server(
+                self._client, path=self.path)
+        finally:
+            os.umask(previous_umask)
         self._set_permissions()
         log.info("Denetim soketi: %s", self.path)
 
     def _set_permissions(self) -> None:
-        """Soketi ``dpi-bypass`` grubuna aç; grup yoksa herkese okunur yap."""
+        """Soketi ``root:dpi-bypass`` / ``0660`` yap ve sonucu **doğrula**.
+
+        Bu soket root servisini yöneten bir denetim kanalıdır; grup
+        çözülemezse ya da izinler istendiği gibi uygulanamazsa soket herkese
+        açılmaz — yalnızca root'a bırakılır (``0600``) ve durum ``degraded``
+        olarak işaretlenir.
+        """
+        self.degraded = False
+        self.degraded_reason = ""
         try:
-            gid = grp.getgrnam(SOCKET_GROUP).gr_gid
-        except KeyError:
-            os.chmod(self.path, 0o666)
-            log.warning("'%s' grubu yok; soket herkese açık (0666) bırakıldı",
-                        SOCKET_GROUP)
+            gid = int(grp.getgrnam(self.group).gr_gid)
+        except (KeyError, TypeError, ValueError):
+            self._degrade(f"'{self.group}' grubu sistemde tanımlı değil")
             return
         try:
             os.chown(self.path, 0, gid)
-            os.chmod(self.path, 0o660)
+            os.chmod(self.path, SOCKET_MODE)
         except OSError as exc:
-            log.warning("soket izinleri ayarlanamadı: %s", exc)
+            self._degrade(f"soket izinleri ayarlanamadı: {exc}")
+            return
+        # Uygulandığını varsayma; gerçekten okunup doğrulanır.
+        try:
+            info = os.stat(self.path)
+        except OSError as exc:
+            self._degrade(f"soket durumu okunamadı: {exc}")
+            return
+        mode = stat_module.S_IMODE(info.st_mode)
+        if info.st_gid != gid or info.st_uid != 0 or mode != SOCKET_MODE:
+            self._degrade(
+                f"soket beklenen sahiplikte değil (uid={info.st_uid}, "
+                f"gid={info.st_gid}, kip=0{mode:o})")
+            return
+        log.info("Soket izinleri: root:%s 0%o", self.group, SOCKET_MODE)
+
+    def _degrade(self, reason: str) -> None:
+        """Güvenli tarafa düş: soketi yalnız root'a bırak ve gürültülü logla."""
+        self.degraded = True
+        self.degraded_reason = reason
+        try:
+            os.chmod(self.path, SOCKET_MODE_DEGRADED)
+        except OSError as exc:
+            reason = f"{reason}; ayrıca 0{SOCKET_MODE_DEGRADED:o} da uygulanamadı: {exc}"
+            self.degraded_reason = reason
+        log.error(
+            "Denetim soketi güvenli kipe düşürüldü (0%o, yalnız root): %s. "
+            "GUI ve komut satırı bağlanamayacak; kurulumu onarın "
+            "(sudo groupadd --system %s && sudo systemctl restart dpi-bypass).",
+            SOCKET_MODE_DEGRADED, reason, self.group)
+
+    def status(self) -> dict:
+        """Soketin gerçek durumu — tanı ekranları için."""
+        data: dict[str, Any] = {
+            "path": self.path,
+            "group": self.group,
+            "degraded": self.degraded,
+            "reason": self.degraded_reason,
+            "expected_mode": f"0{SOCKET_MODE:o}",
+        }
+        try:
+            info = os.stat(self.path)
+        except OSError:
+            data.update({"exists": False, "uid": None, "gid": None, "mode": None})
+            return data
+        data.update({
+            "exists": True,
+            "uid": info.st_uid,
+            "gid": info.st_gid,
+            "mode": f"0{stat_module.S_IMODE(info.st_mode):o}",
+        })
+        return data
 
     async def stop(self) -> None:
         if self._server is not None:
@@ -123,9 +196,11 @@ class IpcClient:
             return {"ok": False, "error": "servis çalışmıyor (soket yok)",
                     "code": "no-service"}
         except PermissionError:
-            return {"ok": False, "error":
-                    "sokete erişim reddedildi — kullanıcınız 'dpi-bypass' "
-                    "grubunda olmayabilir", "code": "permission"}
+            # Sebebi burada tahmin etme: grup üyeliği, oturum grup listesi ve
+            # soket izinleri farklı sorunlardır. Tanıyı session_access yapar.
+            return {"ok": False,
+                    "error": "denetim soketine erişim reddedildi",
+                    "code": "permission"}
         except (ConnectionRefusedError, OSError) as exc:
             return {"ok": False, "error": f"servise bağlanılamadı: {exc}",
                     "code": "no-service"}

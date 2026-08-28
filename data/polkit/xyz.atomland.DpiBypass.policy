@@ -18,4 +18,17 @@
     <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/dpi-bypass/vodafone-helper</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
+  <action id="xyz.atomland.DpiBypass.repair-access">
+    <description>DPI Bypass denetim soketine erişimi onar</description>
+    <description xml:lang="tr">DPI Bypass denetim soketine erişimi onar</description>
+    <message>Kullanıcınızı 'dpi-bypass' grubuna eklemek için kimlik doğrulaması gerekiyor.</message>
+    <message xml:lang="tr">Kullanıcınızı 'dpi-bypass' grubuna eklemek için kimlik doğrulaması gerekiyor.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/dpi-bypass/dpi-bypass-access-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
 </policyconfig>

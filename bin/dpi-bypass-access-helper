@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""pkexec ile root olarak çalışır; **yalnızca** dpi-bypass erişimini onarır.
+
+Kapsam bilerek çok dar tutulmuştur:
+
+* Hiçbir argüman kabul etmez — çağıran taraf ne grup ne kullanıcı seçebilir.
+* Hedef kullanıcı ``PKEXEC_UID``den okunur; bu değeri pkexec'in kendisi
+  koyar, çağıran süreç değil. Ortamdan gelen ad/kullanıcı dizgisi kullanılmaz.
+* Yalnızca sabit ``dpi-bypass`` grubu oluşturulur ve hedef kullanıcı bu tek
+  gruba eklenir. Başka hiçbir grup değiştirilmez.
+* root (uid 0) ve sistem hesapları hedef alınamaz.
+* Hiçbir yerde kabuk kullanılmaz; komutlar liste olarak çalıştırılır.
+"""
+
+import grp
+import os
+import pwd
+import subprocess
+import sys
+
+GROUP = "dpi-bypass"
+
+
+def _fail(message: str) -> int:
+    print(message, file=sys.stderr)
+    return 1
+
+
+def _target_user() -> "tuple[str, int] | None":
+    raw = os.environ.get("PKEXEC_UID", "")
+    if not raw.isdigit():
+        return None
+    uid = int(raw)
+    if uid == 0:
+        return None
+    try:
+        entry = pwd.getpwuid(uid)
+    except KeyError:
+        return None
+    return entry.pw_name, uid
+
+
+def _tool(name: str) -> "str | None":
+    # pkexec ortamı PATH'i daraltır; sistem yolları açıkça aranır.
+    for directory in ("/usr/sbin", "/usr/bin", "/sbin", "/bin",
+                      "/usr/local/sbin", "/usr/local/bin"):
+        candidate = os.path.join(directory, name)
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def main() -> int:
+    if len(sys.argv) != 1:
+        return _fail("kullanım: dpi-bypass-access-helper (argüman almaz)")
+    if os.geteuid() != 0:
+        return _fail("bu yardımcı root olarak çalışmalı (pkexec ile çağrılır)")
+
+    target = _target_user()
+    if target is None:
+        return _fail("Onarılacak masaüstü kullanıcısı belirlenemedi "
+                     "(PKEXEC_UID yok ya da root).")
+    user, uid = target
+
+    try:
+        grp.getgrnam(GROUP)
+    except KeyError:
+        groupadd = _tool("groupadd")
+        if groupadd is None:
+            return _fail("groupadd bulunamadı; shadow-utils kurulu değil.")
+        result = subprocess.run([groupadd, "--system", GROUP],
+                                capture_output=True, text=True)
+        if result.returncode != 0:
+            return _fail(f"'{GROUP}' grubu oluşturulamadı: "
+                         f"{(result.stderr or '').strip()}")
+        try:
+            grp.getgrnam(GROUP)
+        except KeyError:
+            return _fail(f"'{GROUP}' grubu oluşturuldu ama okunamıyor.")
+
+    usermod = _tool("usermod")
+    if usermod is None:
+        return _fail("usermod bulunamadı; shadow-utils kurulu değil.")
+    result = subprocess.run([usermod, "-aG", GROUP, user],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        return _fail(f"'{user}' kullanıcısı '{GROUP}' grubuna eklenemedi "
+                     f"(usermod {result.returncode}): "
+                     f"{(result.stderr or '').strip()}")
+
+    # Başarı varsayılmaz: üyelik NSS üzerinden yeniden okunur.
+    try:
+        entry = pwd.getpwuid(uid)
+        gid = grp.getgrnam(GROUP).gr_gid
+        member = gid in os.getgrouplist(user, entry.pw_gid)
+    except (KeyError, OSError):
+        member = False
+    if not member:
+        return _fail(f"usermod hata vermedi ama '{user}' hâlâ '{GROUP}' "
+                     "grubunda görünmüyor.")
+
+    print(f"'{user}' kullanıcısı '{GROUP}' grubuna eklendi ve doğrulandı.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

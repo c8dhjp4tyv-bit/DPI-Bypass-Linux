@@ -115,36 +115,39 @@ install_dependencies() {
     case "$PKG" in
         dnf|dnf5|yum)
             try_install "$PKG" python3 python3-gobject gtk4 libadwaita \
-                nftables iproute iw NetworkManager polkit curl ca-certificates
+                nftables iproute iw ethtool NetworkManager polkit curl \
+                ca-certificates
             ;;
         apt)
             apt-get update -qq >/dev/null 2>&1 || true
             try_install apt python3 python3-gi python3-gi-cairo \
-                gir1.2-gtk-4.0 gir1.2-adw-1 nftables iproute2 iw \
+                gir1.2-gtk-4.0 gir1.2-adw-1 nftables iproute2 iw ethtool \
                 network-manager curl ca-certificates
             # polkit paketi dağıtım sürümüne göre farklı adlandırılır
             try_install apt polkitd policykit-1
             ;;
         pacman)
             try_install pacman python python-gobject gtk4 libadwaita \
-                nftables iproute2 iw networkmanager polkit curl ca-certificates
+                nftables iproute2 iw ethtool networkmanager polkit curl \
+                ca-certificates
             ;;
         zypper)
             try_install zypper python3 python3-gobject python3-gobject-Gdk \
                 typelib-1_0-Gtk-4_0 typelib-1_0-Adw-1 nftables iproute2 \
-                iw NetworkManager polkit curl ca-certificates
+                iw ethtool NetworkManager polkit curl ca-certificates
             ;;
         apk)
             try_install apk python3 py3-gobject3 gtk4.0 libadwaita \
-                nftables iproute2 iw networkmanager polkit curl ca-certificates
+                nftables iproute2 iw ethtool networkmanager polkit curl \
+                ca-certificates
             ;;
         xbps)
             try_install xbps python3 python3-gobject gtk4 libadwaita \
-                nftables iproute2 iw NetworkManager polkit curl
+                nftables iproute2 iw ethtool NetworkManager polkit curl
             ;;
         eopkg)
             try_install eopkg python3 python-gobject libgtk-4 libadwaita \
-                nftables iproute2 iw networkmanager polkit curl
+                nftables iproute2 iw ethtool networkmanager polkit curl
             ;;
         emerge)
             warn "Gentoo saptandı; paketleri kendiniz kurmanız gerekebilir:"
@@ -178,6 +181,10 @@ check_requirements() {
         warn "tc bulunamadı; Ping düşürme qdisc optimizasyonunu atlayacak."
     command -v iw >/dev/null 2>&1 || \
         warn "iw bulunamadı; Ping düşürme Wi-Fi güç ayarını atlayacak."
+    command -v ethtool >/dev/null 2>&1 || \
+        warn "ethtool bulunamadı; Ping düşürme Ethernet NIC adaylarını atlayacak."
+    command -v sg >/dev/null 2>&1 || \
+        warn "sg bulunamadı (shadow-utils); grup değişikliği için oturum yenilemek gerekebilir."
 }
 
 # ------------------------------------------------------------- kaynak ------
@@ -243,9 +250,11 @@ install_files() {
         install -m 0755 "$SRC_DIR/bin/$launcher" "$BINDIR/$launcher"
     done
 
-    # Vodafone kipi için polkit ile çağrılan yetkilendirme yardımcısı
+    # polkit ile çağrılan yetkilendirme yardımcıları
     install -d -m 0755 "$LIBEXECDIR"
     install -m 0755 "$SRC_DIR/bin/vodafone-helper" "$LIBEXECDIR/vodafone-helper"
+    install -m 0755 "$SRC_DIR/bin/dpi-bypass-access-helper" \
+        "$LIBEXECDIR/dpi-bypass-access-helper"
 
     # Simgeler
     for size in 16 22 24 32 48 64 128 256 512; do
@@ -294,38 +303,130 @@ install_files() {
     ok "Dosyalar yerine kondu."
 }
 
-setup_group() {
-    if ! getent group "$GROUP" >/dev/null 2>&1; then
-        groupadd --system "$GROUP" >/dev/null 2>&1 || true
-    fi
-    local target_user="${SUDO_USER:-}"
-    if [ -z "$target_user" ] && [ -n "${PKEXEC_UID:-}" ]; then
+# Kurulum sonucunun gerçek durumu; final_message ve verify_installation okur.
+INSTALL_USER=""
+GROUP_READY=0
+GROUP_MEMBER_OK=0
+
+# Masaüstü kullanıcısını sırayla dener; root asla hedef alınmaz.
+detect_desktop_user() {
+    local candidate=""
+
+    candidate="${SUDO_USER:-}"
+    if [ -z "$candidate" ] && [ -n "${PKEXEC_UID:-}" ]; then
         # PKEXEC_UID sayısaldır; kullanıcı adına çevir
-        target_user="$(id -nu "$PKEXEC_UID" 2>/dev/null || true)"
+        candidate="$(id -nu "$PKEXEC_UID" 2>/dev/null || true)"
     fi
-    if [ -z "$target_user" ] || [ "$target_user" = "root" ]; then
-        target_user="$(logname 2>/dev/null || true)"
+    if [ -z "$candidate" ] || [ "$candidate" = "root" ]; then
+        candidate="$(logname 2>/dev/null || true)"
     fi
-    if [ -z "$target_user" ] || [ "$target_user" = "root" ]; then
+    if [ -z "$candidate" ] || [ "$candidate" = "root" ]; then
+        # systemd-logind'deki ilk grafik/aktif oturumun sahibi
+        if command -v loginctl >/dev/null 2>&1; then
+            candidate="$(loginctl list-sessions --no-legend 2>/dev/null \
+                | awk '$3 != "root" {print $3; exit}')"
+        fi
+    fi
+    if [ -z "$candidate" ] || [ "$candidate" = "root" ]; then
         # Açık oturumlardaki ilk normal kullanıcı
-        target_user="$(who 2>/dev/null | awk '$1 != "root" {print $1; exit}')"
+        candidate="$(who 2>/dev/null | awk '$1 != "root" {print $1; exit}')"
     fi
-    if [ -z "$target_user" ] || [ "$target_user" = "root" ]; then
+    if [ -z "$candidate" ] || [ "$candidate" = "root" ]; then
         # Tek bir normal kullanıcı varsa onu seç (UID 1000-60000)
-        target_user="$(awk -F: '$3 >= 1000 && $3 < 60000 && $7 !~ /(nologin|false)$/ \
+        candidate="$(awk -F: '$3 >= 1000 && $3 < 60000 && $7 !~ /(nologin|false)$/ \
             {print $1}' /etc/passwd 2>/dev/null | head -2 | \
             { mapfile -t users; [ "${#users[@]}" -eq 1 ] && printf '%s' "${users[0]}"; })"
     fi
-    if [ -n "$target_user" ] && [ "$target_user" != "root" ] \
-       && id "$target_user" >/dev/null 2>&1; then
-        usermod -aG "$GROUP" "$target_user" >/dev/null 2>&1 || true
-        ok "Kullanıcı '$target_user' '$GROUP' grubuna eklendi."
-        INSTALL_USER="$target_user"
-    else
+    [ "$candidate" = "root" ] && candidate=""
+    printf '%s' "$candidate"
+}
+
+# Kullanıcı gerçekten grubun üyesi mi? /etc/group tek kaynak değildir; LDAP
+# ya da SSSD kullanan sistemlerde de doğru cevap 'id -nG' üzerinden gelir.
+#
+# Boru hattı + 'grep -q' bilerek kullanılmaz: grep ilk eşleşmede çıkar, bunu
+# besleyen komut SIGPIPE alır ve 'set -o pipefail' altında eşleşme bulunmuş
+# olmasına rağmen hat başarısız görünür. Bunun yerine tüm çıktı okunup boşlukla
+# çerçevelenmiş tam kelime eşleşmesi yapılır ('dpi-bypass-admin', 'dpi-bypass'
+# sayılmaz).
+user_is_member() {
+    local user="$1" group="$2" names=""
+    names="$(id -nG "$user" 2>/dev/null || true)"
+    case " $names " in
+        *" $group "*) return 0 ;;
+    esac
+    names="$(getent group "$group" 2>/dev/null | awk -F: '{print $4}' \
+        | tr ',' ' ' || true)"
+    case " $names " in
+        *" $user "*) return 0 ;;
+    esac
+    return 1
+}
+
+setup_group() {
+    GROUP_READY=0
+    GROUP_MEMBER_OK=0
+    INSTALL_USER=""
+
+    if ! getent group "$GROUP" >/dev/null 2>&1; then
+        if ! command -v groupadd >/dev/null 2>&1; then
+            warn "groupadd bulunamadı (shadow-utils eksik); '$GROUP' grubu oluşturulamadı."
+            return 1
+        fi
+        # Hata yutulmaz: grup açılamadıysa kurulum bunu bilmeli.
+        if ! groupadd --system "$GROUP" 2>/dev/null; then
+            warn "'$GROUP' grubu oluşturulamadı (groupadd başarısız)."
+            return 1
+        fi
+    fi
+    if ! getent group "$GROUP" >/dev/null 2>&1; then
+        warn "'$GROUP' grubu oluşturuldu ama grup veritabanında görünmüyor."
+        return 1
+    fi
+    GROUP_READY=1
+    ok "'$GROUP' grubu hazır."
+
+    local target_user
+    target_user="$(detect_desktop_user)"
+    if [ -z "$target_user" ] || ! id "$target_user" >/dev/null 2>&1; then
         warn "Masaüstü kullanıcısı saptanamadı. Şunu elle çalıştırın:"
         printf '    sudo usermod -aG %s KULLANICI_ADINIZ\n' "$GROUP"
-        INSTALL_USER=""
+        return 1
     fi
+    INSTALL_USER="$target_user"
+    step "Grup üyeliği ayarlanıyor: kullanıcı '$target_user' → '$GROUP'"
+
+    if user_is_member "$target_user" "$GROUP"; then
+        GROUP_MEMBER_OK=1
+        ok "Kullanıcı '$target_user' zaten '$GROUP' grubunda."
+        return 0
+    fi
+
+    if ! command -v usermod >/dev/null 2>&1; then
+        warn "usermod bulunamadı (shadow-utils eksik); '$target_user' gruba eklenemedi."
+        return 1
+    fi
+
+    # '|| true' YOK: usermod'un çıkış kodu gerçekten kontrol edilir. Aksi
+    # halde kurulum başarısız bir eklemeyi başarılı gibi gösterirdi.
+    local usermod_output="" usermod_rc=0
+    usermod_output="$(usermod -aG "$GROUP" "$target_user" 2>&1)" || usermod_rc=$?
+    if [ "$usermod_rc" -ne 0 ]; then
+        warn "usermod başarısız (çıkış kodu $usermod_rc): ${usermod_output:-ayrıntı yok}"
+        printf '    Elle deneyin: sudo usermod -aG %s %s\n' "$GROUP" "$target_user"
+        return 1
+    fi
+
+    # Başarı varsayılmaz: üyelik grup veritabanından yeniden okunur.
+    if ! user_is_member "$target_user" "$GROUP"; then
+        warn "usermod hata vermedi ama '$target_user' hâlâ '$GROUP' grubunda görünmüyor."
+        printf '    Kontrol edin: id -nG %s\n' "$target_user"
+        return 1
+    fi
+
+    GROUP_MEMBER_OK=1
+    ok "Kullanıcı '$target_user' '$GROUP' grubuna eklendi ve doğrulandı."
+    return 0
 }
 
 enable_service() {
@@ -366,7 +467,108 @@ from gi.repository import Gtk, Adw
     fi
 }
 
+# --------------------------------------------------------- doğrulama ------
+# Kurulum sonunda gerçek sağlık kontrolü. "Kuruldu" yazısı ancak bu adım
+# geçerse basılır; geçmezse tam olarak neyin eksik olduğu söylenir.
+HEALTH_OK=1
+HEALTH_NOTES=()
+
+health_fail() { HEALTH_OK=0; HEALTH_NOTES+=("$1"); warn "$1"; }
+
+verify_installation() {
+    step "Kurulum doğrulanıyor…"
+
+    # 1) grup
+    if [ "$GROUP_READY" -eq 1 ]; then
+        ok "Grup '$GROUP' mevcut."
+    else
+        health_fail "'$GROUP' grubu yok; GUI ve komut satırı servise bağlanamaz."
+    fi
+
+    # 2) hedef kullanıcının üyeliği
+    if [ -n "$INSTALL_USER" ] && [ "$GROUP_MEMBER_OK" -eq 1 ]; then
+        ok "Kullanıcı '$INSTALL_USER' grup veritabanında '$GROUP' üyesi."
+    elif [ -n "$INSTALL_USER" ]; then
+        health_fail "Kullanıcı '$INSTALL_USER' '$GROUP' grubuna eklenemedi."
+    else
+        health_fail "Masaüstü kullanıcısı saptanamadı; grup üyeliği ayarlanmadı."
+    fi
+
+    # 3) servis
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl is-enabled --quiet "$SERVICE" 2>/dev/null; then
+            ok "Servis açılışta başlayacak şekilde etkin."
+        else
+            health_fail "Servis açılışa eklenemedi (systemctl enable)."
+        fi
+        if systemctl is-active --quiet "$SERVICE" 2>/dev/null; then
+            ok "Servis çalışıyor."
+        else
+            health_fail "Servis çalışmıyor. Günlük: journalctl -u $SERVICE -n 40"
+        fi
+    else
+        health_fail "systemd yok; servis elle başlatılmalı: dpi-bypassd"
+    fi
+
+    # 4) soket: var mı, grubu ve izni doğru mu?
+    #    (yol testlerde geçersiz kılınabilsin diye değişkenden okunur)
+    local socket="${DPI_BYPASS_SOCKET:-/run/dpi-bypass/daemon.sock}"
+    local waited=0
+    while [ ! -S "$socket" ] && [ "$waited" -lt 10 ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if [ -S "$socket" ]; then
+        ok "Denetim soketi hazır: $socket"
+        local sock_group sock_mode
+        sock_group="$(stat -c '%G' "$socket" 2>/dev/null || echo '?')"
+        sock_mode="$(stat -c '%a' "$socket" 2>/dev/null || echo '?')"
+        if [ "$sock_group" = "$GROUP" ]; then
+            ok "Soket grubu doğru: $sock_group"
+        else
+            health_fail "Soket grubu '$sock_group' (beklenen '$GROUP')."
+        fi
+        if [ "$sock_mode" = "660" ]; then
+            ok "Soket izni doğru: 0$sock_mode"
+        else
+            health_fail "Soket izni 0$sock_mode (beklenen 0660)."
+        fi
+    else
+        health_fail "Denetim soketi oluşmadı: $socket"
+    fi
+
+    # 5) mevcut oturumun grup listesi: yeniden başlatma gerekecek mi?
+    if [ -n "$INSTALL_USER" ] && [ "$GROUP_MEMBER_OK" -eq 1 ]; then
+        NEEDS_SESSION_REFRESH=0
+        # Kurulum sudo ile çalıştığı için buradaki grup listesi root'undur;
+        # kullanıcının açık oturumu her hâlükârda eski listeyi taşır.
+        if [ -n "${SUDO_USER:-}" ] || [ -n "${PKEXEC_UID:-}" ]; then
+            NEEDS_SESSION_REFRESH=1
+        fi
+        if [ "$NEEDS_SESSION_REFRESH" -eq 1 ]; then
+            if command -v sg >/dev/null 2>&1; then
+                ok "Açık oturum eski grup listesinde; uygulama kendini 'sg' ile onarır."
+            else
+                warn "'sg' komutu yok (shadow-utils). Grup üyeliğinin etkin olması"
+                printf '     için oturumu kapatıp açmanız gerekebilir.\n'
+            fi
+        fi
+    fi
+}
+
 final_message() {
+    if [ "$HEALTH_OK" -ne 1 ]; then
+        printf '\n%s╭──────────────────────────────────────────────╮%s\n' "$C_WARN" "$C_R"
+        printf '%s│%s  %sKURULUM TAMAMLANDI, ANCAK EKSİKLER VAR%s\n' "$C_WARN" "$C_R" "$C_B" "$C_R"
+        printf '%s╰──────────────────────────────────────────────╯%s\n\n' "$C_WARN" "$C_R"
+        for note in "${HEALTH_NOTES[@]}"; do
+            printf '  %s•%s %s\n' "$C_WARN" "$C_R" "$note"
+        done
+        printf '\n  %sTanı için:%s dpi-bypass doctor\n\n' "$C_B" "$C_R"
+        printf '  %sKaldırmak için:%s sudo bash install.sh --uninstall\n\n' "$C_D" "$C_R"
+        return
+    fi
+
     printf '\n%s╭──────────────────────────────────────────────╮%s\n' "$C_OK" "$C_R"
     printf '%s│%s  %sKURULDU:%s %s %s\n' "$C_OK" "$C_R" "$C_B" "$C_R" "$APP_NAME" "$APP_VERSION"
     printf '%s╰──────────────────────────────────────────────╯%s\n\n' "$C_OK" "$C_R"
@@ -381,12 +583,12 @@ final_message() {
     printf '  ya da terminalden: %sdpi-bypass-gui%s\n\n' "$C_B" "$C_R"
 
     if [ -n "${INSTALL_USER:-}" ]; then
-        printf '  %sNot:%s Grup üyeliği yeni eklendiği için ilk açılışta uygulama\n' "$C_WARN" "$C_R"
-        printf '       kendini bir kez yeniden başlatabilir. Sorun çıkarsa oturumu\n'
-        printf '       kapatıp açmanız yeterli.\n\n'
+        printf '  %sNot:%s %s kullanıcısı gruba yeni eklendi. Açık oturum eski grup\n' "$C_WARN" "$C_R" "$INSTALL_USER"
+        printf '       listesini taşıdığı için uygulama ilk açılışta kendini bir kez\n'
+        printf "       'sg' ile yeniden başlatır. Sorun çıkarsa: dpi-bypass doctor\n\n"
     fi
 
-    printf '  %sKomut satırı:%s dpi-bypass status | search | test | logs -f\n' "$C_D" "$C_R"
+    printf '  %sKomut satırı:%s dpi-bypass status | doctor | search | test | logs -f\n' "$C_D" "$C_R"
     printf '  %sKaldırmak için:%s sudo bash install.sh --uninstall\n\n' "$C_D" "$C_R"
 }
 
@@ -406,6 +608,7 @@ uninstall() {
     rm -f "/etc/xdg/autostart/$APP_ID-autostart.desktop"
     rm -f "/usr/share/polkit-1/rules.d/49-dpi-bypass.rules"
     rm -f "$DATADIR/polkit-1/actions/$APP_ID.policy"
+    rm -f /var/lib/dpi-bypass/latency-profiles.json
     rm -f "$DATADIR"/icons/hicolor/*/apps/"$APP_ID".png
     rm -f "$DATADIR/icons/hicolor/scalable/apps/$APP_ID.svg"
     rm -f "$DATADIR/icons/hicolor/symbolic/apps/$APP_ID-symbolic.svg"
@@ -435,10 +638,20 @@ main() {
     check_requirements
     obtain_sources
     install_files
-    setup_group
+    # Başarısızlık burada durdurulmaz; verify_installation tam olarak neyin
+    # eksik kaldığını raporlar ve "kuruldu" mesajı basılmaz.
+    setup_group || true
     enable_service
     verify_gui
+    verify_installation
     final_message
 }
+
+# Test kancası: betik "source" edildiğinde yalnız fonksiyonlar yüklensin,
+# kurulum çalışmasın. Böylece setup_group gibi parçalar root olmadan,
+# sahte usermod/getent/id ile sınanabilir.
+if [ "${DPI_BYPASS_LIB_ONLY:-0}" = "1" ]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 main "$@"

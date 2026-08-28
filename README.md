@@ -47,7 +47,7 @@ sudo bash install.sh --uninstall
 | **DNS** | Sistemin tüm DNS trafiği (53/udp, 53/tcp) yerel köprüye yönlendirilir ve **DNS-over-HTTPS** ile taşınır. Birincil **Cloudflare**, yedekler **Google** ve **Quad9**. DNS zehirlenmesi ve DNS düzeyindeki engel böylece tamamen aşılır. |
 | **DPI** | Engelli hedeflere giden TCP 80/443 bağlantıları yerel şeffaf vekile düşer. İlk istemci verisi (TLS ClientHello / HTTP isteği) seçilen stratejiye göre yeniden şekillendirilerek gönderilir; sunucu veriyi eksiksiz alır, yol üstündeki DPI ise SNI'yi göremez. |
 | **QUIC** | İsteğe bağlı olarak engelli hedeflere UDP/443 reddedilir; tarayıcılar atlatma uygulanabilen TCP'ye döner. |
-| **Ping düşürme (Beta)** | Aktif fiziksel arayüzde Wi-Fi güç tasarrufunu ve yalnız güvenle geri yüklenebilen basit FIFO kuyrukları değerlendirir. Önce/sonra RTT, jitter ve paket kaybını ölçer; doğrulanmış kazanç yoksa değişikliği geri alır. |
+| **Ping düşürme (Beta)** | Aktif fiziksel arayüzde donanıma uyarlanmış adayları (Wi-Fi güç tasarrufu, `fq_codel`/`fq`/`cake`, Ethernet EEE ve RX coalescing) tek tek uygulayıp ölçer, her denemeden sonra geri alır ve yalnız doğrulanmış kazancı olan adayı bırakır. Kazanç yoksa hiçbir ayar değişmez. |
 | **Diğer trafik** | Yönlendirilmez. ICMP (ping), oyun/VoIP UDP trafiği, torrent, VPN — hiçbiri vekilden geçmez, ölçülebilir bir etki oluşmaz. |
 
 ### Atlatma yöntemleri
@@ -113,32 +113,81 @@ Bu özellik bir VPN değildir; ISP rotasını, fiziksel mesafeyi veya uzak
 sunucunun yükünü değiştiremez ve her ağda daha düşük ping garanti etmez. Esas
 amacı bilgisayar kaynaklı yerel kuyruklanma ve jitter nedenlerini azaltmaktır.
 
-Kip açıldığında varsayılan ağ geçidi ile IP tabanlı kararlı uzak hedeflerden
-birden fazla örnek alınır. Median/minimum/p95 RTT, jitter ve paket kaybı ayrı
-hesaplanır. ICMP kullanılamazsa DNS çözümleme süresini karıştırmayan doğrudan
-TCP-connect ölçümüne geçilir. Ardından yalnız desteklenen ayarlar denenir:
+### Nasıl çalışır: aday tabanlı ölçüm
 
-- Wi-Fi arayüzünde sürücü destekliyorsa runtime güç tasarrufu kapatılır.
-- Mevcut kök qdisc yalnız `pfifo`, `bfifo` veya `pfifo_fast` gibi eksiksiz
-  geri yüklenebilir basit bir FIFO ise `fq_codel` denenir.
-- `cake`, `fq_codel`, `fq`, `mq`, `noqueue` ve tüm bilinmeyen/custom qdisc
-  yapıları korunur.
+Tek bir ayarı uygulayıp "oldu" demek yerine motor her adayı ayrı ayrı ölçer:
 
-Değişiklikten sonra aynı çoklu örnek ölçümü tekrarlanır. Paket kaybı artarsa,
-bağlantı kesilirse, RTT/jitter kötüleşirse veya fark ölçüm gürültüsünden açıkça
-büyük değilse eski ayarlar otomatik geri alınır. Ağ değişiminde önce eski
-arayüz geri yüklenir; servis kapanırken ve `dpi-bypassd --cleanup` çalışırken
-de aynı idempotent geri alma tarifi kullanılır.
+```
+taban ölçüm
+  → aday A uygula → ölç → geri al
+  → aday B uygula → ölç → geri al
+  → aday C uygula → ölç → geri al
+  → istatistiksel olarak anlamlı kazancı olan en iyi adayı seç
+  → uygula → bağımsız son doğrulama → kazanç tekrarlamazsa geri al
+```
 
-DNS, MTU, rota, DHCP, IPv6, firewall, TCP buffer/sysctl, BBR, ECN ve CPU
-governor ayarları bu kipin kapsamı dışındadır. Doğrulanmış kazanç yoksa arayüz
-bunu açıkça söyler; tahmini milisaniye veya yüzde göstermez.
+Her ölçüm noktası ısınma turu + birden çok ölçüm turu içerir. Varsayılan ağ
+geçidi ile IP tabanlı kararlı uzak hedeflerden örnek alınır; median, minimum,
+p95 RTT, jitter, yayılım (p95 − min) ve paket kaybı ayrı hesaplanır. ICMP
+kullanılamazsa DNS çözümleme süresini karıştırmayan doğrudan TCP-connect
+ölçümüne geçilir.
+
+### Adaylar
+
+Aday kümesi donanıma ve bağlantı türüne göre üretilir:
+
+| Aday | Ne zaman | Ne yapar |
+|---|---|---|
+| Wi-Fi güç tasarrufu | kablosuz arayüzde `iw` varsa ve güç tasarrufu açıksa | `iw dev … set power_save off` — uyku/uyanma gecikmesini kaldırır |
+| `fq_codel` / `fq` / `cake` | kök qdisc **yalnız** eksiksiz geri yüklenebilir basit bir FIFO ise (`pfifo`, `bfifo`, `pfifo_fast`); `cake` ayrıca `sch_cake` modülü varsa | kök qdisc'i değiştirir |
+| EEE kapalı | Ethernet'te `ethtool --show-eee` "enabled" diyorsa | `ethtool --set-eee … eee off` — LPI uyanma gecikmesini kaldırır |
+| Düşük gecikmeli RX coalescing | Ethernet'te `ethtool -c` okunabiliyor ve adaptive-rx açık / rx-usecs > 0 ise | `ethtool -C … adaptive-rx off rx-usecs 0` |
+
+Tekil adaylardan birden fazlası kazanç sağlarsa birleşimi de ölçülür ve en
+iyisi seçilir. Sürücü ya da araç desteklemiyorsa aday sessizce atlanır — hata
+üretilmez. `cake`, `fq_codel`, `fq`, `mq`, `noqueue` ve tüm bilinmeyen/custom
+qdisc yapıları korunur; kullanıcının kurduğu bir qdisc asla ezilmez.
+
+### Kabul ve geri alma eşikleri
+
+Gürültü kazanç sayılmaz: 20.1 ms → 19.8 ms reddedilir, 25 → 20 ms /
+p95 55 → 31 ms / jitter 8 → 3 ms kabul edilir. Aşağıdakilerden biri olursa
+değişiklik geri alınır:
+
+- bağlantı kesilirse ya da ölçüm yöntemi değişirse,
+- paket kaybı artarsa,
+- median, p95 ya da jitter kötüleşirse,
+- son doğrulamada kazanç tekrarlanmazsa,
+- aday yarım uygulanırsa (uygulanan adımların hepsi geri alınır),
+- ağ/arayüz değişirse,
+- tarama sırasında ayar dışarıdan değiştirilirse (o zaman tarama durur ve
+  araya giren ayar korunur).
+
+### Ağ başına öğrenme
+
+Doğrulanan en iyi aday ağ parmak izi ile `/var/lib/dpi-bypass/latency-profiles.json`
+içinde saklanır. Aynı ağa dönüldüğünde önce o aday uygulanıp kısa bir
+doğrulama yapılır; artık kazanç sağlamıyorsa geri alınır, kayıt silinir ve tam
+tarama yeniden çalışır.
+
+### Kapsam dışı
+
+DNS, MTU, rota, DHCP, IPv6, firewall, TCP buffer/kalıcı sysctl, BBR, ECN ve
+CPU governor ayarları bu kipin kapsamı dışındadır — hiçbiri bir oyunun UDP
+RTT'sini düşürmez, bir kısmı bağlantıyı bozar. Gerçek bufferbloat ölçümü hattı
+doyurmayı gerektirdiği için yapılmaz; ölçülmeyen bir değer ölçülmüş gibi de
+gösterilmez. Doğrulanmış kazanç yoksa arayüz bunu açıkça söyler ve tahmini
+milisaniye veya yüzde üretmez.
+
+Servis kapanırken, ağ değişirken ve `dpi-bypassd --cleanup` çalışırken aynı
+idempotent geri alma tarifi (`/run/dpi-bypass/latency.json`) kullanılır; servis
+çökerse yeniden başladığında bu tarif önce uygulanır.
 
 ```bash
-dpi-bypass latency status
-dpi-bypass latency on
-dpi-bypass latency off
-dpi-bypass latency test
+dpi-bypass latency status   # aday sonuçları, önce/sonra ölçüm ve kazanç
+dpi-bypass latency on       # aday taramasını başlat (birkaç dakika sürebilir)
+dpi-bypass latency off      # kipi kapat, tüm değişiklikleri geri al
+dpi-bypass latency test     # yalnız ölç, hiçbir şeyi değiştirme
 ```
 
 ---
@@ -227,6 +276,7 @@ dpi-bypass set mode=all dns_provider=quad9
 dpi-bypass disable / enable
 dpi-bypass vodafone status  # hotspot TTL düzeltmesi (on / off)
 dpi-bypass latency status   # Ping düşürme (on / off / test)
+dpi-bypass doctor           # soket erişimi tanısı (grup / oturum / soket)
 ```
 
 ---
@@ -246,6 +296,31 @@ hiçbir zaman yarım kurulmuş kurallarla kalmaz.
 
 `dpi-bypass` grubundaki kullanıcılar arayüzden servisi parola sormadan
 yönetebilir (polkit kuralı kurulur). Kurulum betiği sizi bu gruba ekler.
+
+### Denetim soketi ve grup erişimi
+
+Servis `/run/dpi-bypass/daemon.sock` üzerinden yönetilir. Soket **root:dpi-bypass
+/ 0660** olarak kurulur ve bu gerçekten uygulanıp uygulanmadığı `stat` ile
+yeniden okunarak doğrulanır. Grup çözülemez ya da izinler uygulanamazsa soket
+herkese açılmaz; yalnız root'a bırakılır (`0600`) ve servis günlüğüne hata
+yazılır.
+
+"Erişim reddedildi" hatasının tek bir sebebi yoktur; `dpi-bypass doctor` hangisi
+olduğunu söyler:
+
+| Durum | Anlamı | Çözüm |
+|---|---|---|
+| `group-missing` | `dpi-bypass` grubu sistemde yok | `sudo groupadd --system dpi-bypass` |
+| `not-a-member` | Kullanıcı grup veritabanında üye değil | `sudo usermod -aG dpi-bypass $USER` ya da arayüzdeki **Erişimi onar** |
+| `stale-session` | Kullanıcı üye ama **açık oturum** eski grup listesinde | Uygulama kendini `sg dpi-bypass -c …` ile yeniden başlatır |
+| `no-socket` | Servis çalışmıyor | `sudo systemctl start dpi-bypass` |
+| `socket-permissions` | Soketin grubu/kipi beklenenden farklı | `sudo systemctl restart dpi-bypass` |
+
+`usermod -aG` **çalışan süreçlerin** ek gruplarını değiştirmez; bu yüzden
+kurulumdan sonra grup eklense bile açık masaüstü oturumu eski listeyi taşır.
+GUI ve komut satırı bu durumu ayırt eder ve `sg` ile bir kez (döngü koruması
+ile) kendini yeniden başlatır — oturum kapatmak ya da yeniden başlatmak
+gerekmez. `sg` yoksa bu açıkça söylenir.
 
 ---
 
@@ -282,7 +357,8 @@ yönetebilir (polkit kuralı kurulur). Kurulum betiği sizi bu gruba ekler.
 - Linux, systemd
 - Python 3.8+
 - nftables (yoksa iptables)
-- iproute2/`tc` ve `iw` (Ping düşürme alt özellikleri; yoksa güvenle atlanır)
+- iproute2/`tc`, `iw` ve `ethtool` (Ping düşürme adayları; yoksa güvenle atlanır)
+- `sg` (shadow-utils) — grup üyeliği yeni eklendiğinde oturum kapatmadan uygulanır
 - GTK 4 + libadwaita 1.2+ ve PyGObject (yalnızca arayüz için)
 - Servis root olarak çalışır (`CAP_NET_ADMIN`, `CAP_NET_RAW`)
 
@@ -313,7 +389,8 @@ src/dpibypass/
   dnsserver.py   yerel DNS köprüsü
   proxy.py       şeffaf TCP vekil
   firewall.py    nftables / iptables kuralları
-  latency.py     ölçüm, güvenli runtime optimizasyonu ve geri alma
+  latency.py     aday tabanlı ölçüm, güvenli runtime optimizasyonu, geri alma
+  session_access.py  grup / oturum / soket erişim tanısı ve 'sg' onarımı
   vodafone.py    hotspot TTL düzeltmesi (ayrı tabloda, eşik korumalı)
   netmon.py      netlink ağ değişikliği izleyicisi
   isps.py        operatör profilleri ve saptama
