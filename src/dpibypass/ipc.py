@@ -15,7 +15,7 @@ import socket
 import stat as stat_module
 from typing import Any, Awaitable, Callable
 
-from .constants import (RUN_DIR, SOCKET_GROUP, SOCKET_MODE,
+from .constants import (SOCKET_GROUP, SOCKET_MODE,
                         SOCKET_MODE_DEGRADED, SOCKET_PATH)
 
 log = logging.getLogger("dpibypass.ipc")
@@ -37,7 +37,14 @@ class IpcServer:
         self._server: asyncio.base_events.Server | None = None
 
     async def start(self) -> None:
-        os.makedirs(RUN_DIR, mode=0o755, exist_ok=True)
+        # Varsayılan soket yolu /run/dpi-bypass altında kalır; ancak testler
+        # ve gömülü kullanımlar özel bir yol verdiğinde onun üst dizinini
+        # hazırlamalıyız. Global RUN_DIR kullanmak path parametresini fiilen
+        # görmezden geliyor ve root olmayan ortamlarda gereksiz /run yazma
+        # denemesine yol açıyordu.
+        socket_dir = os.path.dirname(self.path)
+        if socket_dir:
+            os.makedirs(socket_dir, mode=0o755, exist_ok=True)
         try:
             os.unlink(self.path)
         except FileNotFoundError:
