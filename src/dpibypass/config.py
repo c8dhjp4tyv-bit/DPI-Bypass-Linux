@@ -6,7 +6,7 @@ import json
 import logging
 import os
 import time
-from typing import Any
+from typing import Any, Iterable
 
 from .constants import (CONFIG_DIR, CONFIG_FILE, DEFAULT_BLOCKED_DOMAINS,
                         STATE_DIR, STATE_FILE, VODAFONE_MAX_NETWORKS,
@@ -209,3 +209,16 @@ class State:
 
     def learned_domains(self) -> list[str]:
         return list(self.data.get("learned_domains", []))
+
+    def forget_domains(self, domains: Iterable[str]) -> list[str]:
+        """Verilen alan adlarını yanlış-öğrenme listesinden kaldır."""
+        unwanted = {domain.lower().strip(".") for domain in domains if domain}
+        learned = self.data.setdefault("learned_domains", [])
+        removed = [domain for domain in learned
+                   if str(domain).lower().strip(".") in unwanted]
+        if removed:
+            self.data["learned_domains"] = [
+                domain for domain in learned if domain not in removed
+            ]
+            self.save()
+        return removed

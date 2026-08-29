@@ -18,12 +18,14 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "src"))
 
-from dpibypass import desync, isps, resolver, strategies, tlsutil  # noqa: E402
-from dpibypass.config import Config  # noqa: E402
+from dpibypass import (connectivity, desync, isps, resolver, strategies,  # noqa: E402
+                       tlsutil)
+from dpibypass.config import Config, State  # noqa: E402
 from dpibypass.util import domain_matches  # noqa: E402
 
 
@@ -349,6 +351,60 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(order[0].name, "oob-snimid")
         self.assertNotIn("none", [s.name for s in order])
         self.assertEqual(len(order), len(strategies.CATALOG) - 1)
+
+
+class TestConnectivityChecks(unittest.TestCase):
+    def test_effective_networkmanager_uri_is_protected(self):
+        import subprocess as sp
+
+        output = ("[main]\nplugins=keyfile\n\n[connectivity]\n"
+                  "uri=http://check.example.net/path\n")
+        result = sp.CompletedProcess(["NetworkManager", "--print-config"],
+                                     0, output, "")
+        with mock.patch.object(connectivity, "which",
+                               return_value="/usr/bin/NetworkManager"), \
+                mock.patch.object(connectivity, "run", return_value=result):
+            domains = connectivity.networkmanager_check_domains()
+
+        self.assertIn("check.example.net", domains)
+        self.assertIn("ping.archlinux.org", domains)
+
+    def test_invalid_or_non_http_uri_is_ignored(self):
+        self.assertEqual(connectivity._hostname("file:///tmp/check"), "")
+        self.assertEqual(connectivity._hostname("not a uri"), "")
+
+    def test_old_false_positive_is_removed_from_state(self):
+        tmp = tempfile.mkdtemp(prefix="dpibypass-connectivity-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        state = State(path=os.path.join(tmp, "state.json"))
+        state.data["learned_domains"] = [
+            "ping.archlinux.org", "blocked.example", "PING.ARCHLINUX.ORG.",
+        ]
+
+        removed = state.forget_domains({"ping.archlinux.org"})
+
+        self.assertEqual(removed,
+                         ["ping.archlinux.org", "PING.ARCHLINUX.ORG."])
+        self.assertEqual(state.learned_domains(), ["blocked.example"])
+
+    def test_daemon_never_bypasses_or_learns_connectivity_host(self):
+        from dpibypass import daemon as dmod
+
+        daemon = dmod.Daemon.__new__(dmod.Daemon)
+        daemon.direct_domains = {"ping.archlinux.org"}
+        daemon.config = mock.Mock()
+        daemon.config.domains.return_value = ["discord.com"]
+        daemon.state = mock.Mock()
+        daemon.state.learned_domains.return_value = ["ping.archlinux.org"]
+        daemon.firewall = mock.Mock()
+
+        self.assertFalse(daemon._should_bypass("ping.archlinux.org", "1.2.3.4"))
+        daemon._on_dns_answer("ping.archlinux.org", ["1.2.3.4"])
+        asyncio.run(daemon._probe_new_domain("ping.archlinux.org", ["1.2.3.4"]))
+        asyncio.run(daemon._on_result("ping.archlinux.org", False, False,
+                                      "geçici hata"))
+        daemon.firewall.add_ips.assert_not_called()
+        daemon.state.learn_domain.assert_not_called()
 
 
 # --------------------------------------------------------------------------- #

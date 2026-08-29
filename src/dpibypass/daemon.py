@@ -22,6 +22,7 @@ from typing import Optional
 
 from . import isps, logging_setup, strategies
 from .config import Config, State
+from .connectivity import networkmanager_check_domains
 from .constants import DNS_PORT, PROXY_PORT, VODAFONE_TTL_VALUE
 from .desync import capabilities
 from .dnsserver import DnsServer
@@ -51,6 +52,13 @@ class Daemon:
     def __init__(self, verbose: bool = False) -> None:
         self.config = Config()
         self.state = State()
+        self.direct_domains = networkmanager_check_domains()
+        removed = self.state.forget_domains(self.direct_domains)
+        if removed:
+            log.info("Bağlantı denetimi yanlış engelli-site kaydından "
+                     "temizlendi: %s", ", ".join(sorted(removed)))
+        log.debug("Doğrudan bırakılan bağlantı denetimleri: %s",
+                  ", ".join(sorted(self.direct_domains)))
         self.verbose = verbose or bool(self.config["verbose"])
 
         self.resolver = dns_resolver
@@ -224,10 +232,14 @@ class Daemon:
         return self.active_strategy
 
     def bypass_domains(self) -> list[str]:
-        return self.config.domains() + self.state.learned_domains()
+        return [domain for domain in
+                self.config.domains() + self.state.learned_domains()
+                if not domain_matches(domain, self.direct_domains)]
 
     def _should_bypass(self, host: str, dst_ip: str) -> bool:
         if not host:
+            return False
+        if domain_matches(host, self.direct_domains):
             return False
         return domain_matches(host, self.bypass_domains())
 
@@ -235,6 +247,8 @@ class Daemon:
         """Çözülen alan adlarını izle: bilinen engellileri yönlendirmeye ekle,
         bilinmeyenleri gerekirse sınayarak öğren."""
         if not addresses or not qname:
+            return
+        if domain_matches(qname, self.direct_domains):
             return
         known = domain_matches(qname, self.bypass_domains())
         if known:
@@ -264,6 +278,8 @@ class Daemon:
         engellidir ve kalıcı olarak listeye alınır. Böylece "akıllı" kipte
         de her site kapsanır, üstelik diğer trafik vekilden geçmez.
         """
+        if domain_matches(host, self.direct_domains):
+            return
         async with self._probe_semaphore:
             if self.status != STATE_ACTIVE or self.active_strategy is None:
                 return
@@ -283,6 +299,8 @@ class Daemon:
 
     async def _on_result(self, host: str, ok: bool, bypassed: bool,
                          error: str) -> None:
+        if domain_matches(host, self.direct_domains):
+            return
         if ok:
             if bypassed:
                 self._strategy_failures = 0
