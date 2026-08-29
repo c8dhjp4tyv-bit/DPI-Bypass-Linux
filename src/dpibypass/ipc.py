@@ -15,12 +15,17 @@ import socket
 import stat as stat_module
 from typing import Any, Awaitable, Callable
 
-from .constants import (SOCKET_GROUP, SOCKET_MODE,
+from .constants import (IPC_MAX_MESSAGE_BYTES, SOCKET_GROUP, SOCKET_MODE,
                         SOCKET_MODE_DEGRADED, SOCKET_PATH)
 
 log = logging.getLogger("dpibypass.ipc")
 
 Handler = Callable[[dict], Awaitable[dict]]
+
+
+def _protocol_error(code: str, message: str) -> dict:
+    """Protokol katmanındaki deterministik hata yanıtını üret."""
+    return {"ok": False, "error": message, "code": code}
 
 
 class IpcServer:
@@ -53,8 +58,11 @@ class IpcServer:
         # soketi umask'e göre oluşturur, bu yüzden önce dar bir umask kur.
         previous_umask = os.umask(0o177)
         try:
+            # StreamReader'ın varsayılan yaklaşık 64 KiB sınırına dolaylı
+            # olarak güvenmek yerine protokolün açık ve iki yönlü limitini
+            # kullan. Aşım _client içinde kontrollü hata yanıtına çevrilir.
             self._server = await asyncio.start_unix_server(
-                self._client, path=self.path)
+                self._client, path=self.path, limit=IPC_MAX_MESSAGE_BYTES)
         finally:
             os.umask(previous_umask)
         self._set_permissions()
@@ -145,12 +153,60 @@ class IpcServer:
         except OSError:
             pass
 
+    async def _send_response(self, writer: asyncio.StreamWriter,
+                             response: Any) -> None:
+        """Yanıtı doğrula, boyutlandır ve tek bir sınırlı JSON satırı yaz."""
+        if not isinstance(response, dict):
+            log.error("IPC işleyici nesne olmayan yanıt döndürdü: %s",
+                      type(response).__name__)
+            response = _protocol_error(
+                "invalid-response", "servis geçersiz yanıt üretti")
+        try:
+            payload = (json.dumps(response, ensure_ascii=False).encode("utf-8")
+                       + b"\n")
+        except (TypeError, ValueError) as exc:
+            log.exception("IPC yanıtı JSON olarak kodlanamadı")
+            response = _protocol_error(
+                "invalid-response", f"servis yanıtı kodlanamadı: {exc}")
+            payload = (json.dumps(response, ensure_ascii=False).encode("utf-8")
+                       + b"\n")
+        if len(payload) > IPC_MAX_MESSAGE_BYTES:
+            log.error("IPC yanıtı boyut sınırını aştı: %d > %d bayt",
+                      len(payload), IPC_MAX_MESSAGE_BYTES)
+            response = _protocol_error(
+                "response-too-large", "servis yanıtı boyut sınırını aştı")
+            payload = (json.dumps(response, ensure_ascii=False).encode("utf-8")
+                       + b"\n")
+        writer.write(payload)
+        await writer.drain()
+
     async def _client(self, reader: asyncio.StreamReader,
                       writer: asyncio.StreamWriter) -> None:
         try:
             while True:
-                line = await reader.readline()
+                try:
+                    line = await reader.readline()
+                except ValueError:
+                    # StreamReader, ayarlanan limit aşılınca ValueError üretir.
+                    # İstemciye anlaşılır bir protokol hatası verip bağlantıyı
+                    # kapat; aynı akışta çerçeve sınırını yeniden eşlemek güvenli
+                    # değildir.
+                    await self._send_response(
+                        writer,
+                        _protocol_error(
+                            "request-too-large", "istek boyut sınırını aştı"),
+                    )
+                    break
                 if not line:
+                    break
+                # EOF ile sonlanan bir çerçevede StreamReader doğrudan baytları
+                # döndürebilir; limit kontrolünü bu yol için de açıkça uygula.
+                if len(line) > IPC_MAX_MESSAGE_BYTES:
+                    await self._send_response(
+                        writer,
+                        _protocol_error(
+                            "request-too-large", "istek boyut sınırını aştı"),
+                    )
                     break
                 try:
                     request = json.loads(line.decode("utf-8"))
@@ -164,8 +220,7 @@ class IpcServer:
                     except Exception as exc:  # işleyici hatası bağlantıyı düşürmesin
                         log.exception("IPC işleyici hatası")
                         response = {"ok": False, "error": str(exc)}
-                writer.write(json.dumps(response, ensure_ascii=False).encode() + b"\n")
-                await writer.drain()
+                await self._send_response(writer, response)
         except (ConnectionError, asyncio.IncompleteReadError):
             pass
         finally:
@@ -185,20 +240,50 @@ class IpcClient:
     def call(self, cmd: str, **kwargs: Any) -> dict:
         request = {"cmd": cmd}
         request.update(kwargs)
+        # JSON kodlama ve çerçeve limiti soket açılmadan önce doğrulanır. Böylece
+        # yerel programlama hatası servis erişim hatası gibi raporlanmaz.
+        try:
+            payload = (json.dumps(request, ensure_ascii=False).encode("utf-8")
+                       + b"\n")
+        except (TypeError, ValueError) as exc:
+            return _protocol_error(
+                "invalid-request", f"istek JSON olarak kodlanamadı: {exc}")
+        if len(payload) > IPC_MAX_MESSAGE_BYTES:
+            return _protocol_error(
+                "request-too-large", "istek boyut sınırını aştı")
+
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(self.timeout)
         try:
             sock.connect(self.path)
-            sock.sendall(json.dumps(request, ensure_ascii=False).encode() + b"\n")
-            buf = b""
+            sock.sendall(payload)
+            buf = bytearray()
             while b"\n" not in buf:
-                chunk = sock.recv(65536)
+                # Bir adet fazladan bayt okumaya izin ver; bu sayede sınırın
+                # aşıldığını kesin biçimde saptarken bellek büyümesi sınırlı
+                # kalır. Normal yanıtlar ilk yeni satırda hemen sonlanır.
+                remaining = IPC_MAX_MESSAGE_BYTES + 1 - len(buf)
+                if remaining <= 0:
+                    return _protocol_error(
+                        "response-too-large", "servis yanıtı boyut sınırını aştı")
+                chunk = sock.recv(min(65536, remaining))
                 if not chunk:
                     break
-                buf += chunk
+                buf.extend(chunk)
+                if len(buf) > IPC_MAX_MESSAGE_BYTES:
+                    return _protocol_error(
+                        "response-too-large", "servis yanıtı boyut sınırını aştı")
             if not buf:
                 return {"ok": False, "error": "servisten yanıt yok"}
-            return json.loads(buf.split(b"\n", 1)[0].decode("utf-8"))
+            try:
+                response = json.loads(
+                    bytes(buf).split(b"\n", 1)[0].decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                return _protocol_error("invalid-response", f"bozuk yanıt: {exc}")
+            if not isinstance(response, dict):
+                return _protocol_error(
+                    "invalid-response", "servis yanıtı JSON nesnesi değil")
+            return response
         except FileNotFoundError:
             return {"ok": False, "error": "servis çalışmıyor (soket yok)",
                     "code": "no-service"}
@@ -211,8 +296,6 @@ class IpcClient:
         except (ConnectionRefusedError, OSError) as exc:
             return {"ok": False, "error": f"servise bağlanılamadı: {exc}",
                     "code": "no-service"}
-        except json.JSONDecodeError as exc:
-            return {"ok": False, "error": f"bozuk yanıt: {exc}"}
         finally:
             try:
                 sock.close()
