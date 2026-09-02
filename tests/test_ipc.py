@@ -86,6 +86,66 @@ class TestIpcServerProtocol(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(response["ok"])
         self.assertEqual(response["code"], "response-too-large")
 
+    async def test_oversized_response_is_refused_without_full_serialization(self):
+        payload = _LazyHugeList(100_000)
+
+        async def handler(_request):
+            return {"ok": True, "data": payload}
+
+        await self._start(handler)
+        response = await self._exchange(b'{"cmd":"status"}\n')
+
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["code"], "response-too-large")
+        self.assertLess(
+            payload.consumed, 1024,
+            "sunucu sınırı aşan yanıtı yine de tümüyle serileştirdi")
+
+
+class _LazyHugeList(list):
+    """Serileştirilirse devasa olan, ama tembel üretilen bir dizi.
+
+    Tüm veriyi gerçekten ayırmadan "işleyici çok büyük bir yanıt döndürdü"
+    durumunu kurar, böylece test kodlayıcının nereye kadar ilerlediğini
+    ölçebilir.
+    """
+
+    def __init__(self, items: int) -> None:
+        super().__init__()
+        self.items = items
+        self.consumed = 0
+
+    def __len__(self) -> int:
+        return self.items
+
+    def __iter__(self):
+        for _ in range(self.items):
+            self.consumed += 1
+            yield "x" * 1024
+
+
+class TestBoundedEncoding(unittest.TestCase):
+    def test_encoder_stops_at_the_budget_instead_of_building_the_whole_frame(self):
+        # 100 MB'lık bir yanıt: json.dumps ile önce tamamı bellekte kurulurdu ve
+        # 256 KiB'lik çerçeve limiti ancak ondan sonra devreye girerdi.
+        payload = _LazyHugeList(100_000)
+
+        self.assertIsNone(
+            ipc._encode_bounded({"ok": True, "data": payload}, 4096))
+        self.assertLess(
+            payload.consumed, 64,
+            "kodlayıcı bütçe aşıldıktan sonra da veriyi tüketmeyi sürdürdü")
+
+    def test_encoder_returns_the_exact_frame_when_it_fits(self):
+        encoded = ipc._encode_bounded({"ok": True, "data": "ölçüm"}, 4096)
+
+        self.assertIsNotNone(encoded)
+        self.assertEqual(json.loads(encoded.decode("utf-8")),
+                         {"ok": True, "data": "ölçüm"})
+        # ensure_ascii=False korunmalı: aksi halde Türkçe metin kaçışlanır ve
+        # çerçeve boyutu sessizce büyür.
+        self.assertIn("ölçüm".encode("utf-8"), encoded)
+
 
 class TestIpcClientProtocol(unittest.TestCase):
     def test_non_serializable_request_fails_before_socket_creation(self):

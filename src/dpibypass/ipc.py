@@ -28,6 +28,27 @@ def _protocol_error(code: str, message: str) -> dict:
     return {"ok": False, "error": message, "code": code}
 
 
+def _encode_bounded(value: Any, limit: int) -> bytes | None:
+    """JSON'u parça parça kodla; bütçe aşılır aşılmaz vazgeç.
+
+    ``json.dumps`` tüm çıktıyı önce bellekte kurar, bu yüzden boyut sınırı
+    ancak devasa bir dize zaten ayrıldıktan sonra devreye girerdi: 256 KiB'lik
+    çerçeve limiti, yüz megabaytlık bir yanıtın tahsisini engellemez, yalnızca
+    tahsis bittikten sonra yazılmasını engeller. ``iterencode`` parçaları tembel
+    üretir, bu yüzden bütçe aşılınca dönmek tepe bellek kullanımını sınırın
+    hemen üstünde tutar. Sınır aşıldıysa ``None`` döner.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in json.JSONEncoder(ensure_ascii=False).iterencode(value):
+        encoded = chunk.encode("utf-8")
+        total += len(encoded)
+        if total > limit:
+            return None
+        chunks.append(encoded)
+    return b"".join(chunks)
+
+
 class IpcServer:
     def __init__(self, handler: Handler, path: str = SOCKET_PATH,
                  group: str = SOCKET_GROUP) -> None:
@@ -161,23 +182,28 @@ class IpcServer:
                       type(response).__name__)
             response = _protocol_error(
                 "invalid-response", "servis geçersiz yanıt üretti")
+        # Satır sonu da çerçevenin parçası, bütçeden bir bayt ayır.
+        budget = IPC_MAX_MESSAGE_BYTES - 1
         try:
-            payload = (json.dumps(response, ensure_ascii=False).encode("utf-8")
-                       + b"\n")
+            body = _encode_bounded(response, budget)
         except (TypeError, ValueError) as exc:
             log.exception("IPC yanıtı JSON olarak kodlanamadı")
-            response = _protocol_error(
-                "invalid-response", f"servis yanıtı kodlanamadı: {exc}")
-            payload = (json.dumps(response, ensure_ascii=False).encode("utf-8")
-                       + b"\n")
-        if len(payload) > IPC_MAX_MESSAGE_BYTES:
-            log.error("IPC yanıtı boyut sınırını aştı: %d > %d bayt",
-                      len(payload), IPC_MAX_MESSAGE_BYTES)
-            response = _protocol_error(
-                "response-too-large", "servis yanıtı boyut sınırını aştı")
-            payload = (json.dumps(response, ensure_ascii=False).encode("utf-8")
-                       + b"\n")
-        writer.write(payload)
+            body = _encode_bounded(
+                _protocol_error(
+                    "invalid-response", f"servis yanıtı kodlanamadı: {exc}"),
+                budget)
+        if body is None:
+            log.error("IPC yanıtı boyut sınırını aştı: > %d bayt", budget)
+            body = _encode_bounded(
+                _protocol_error(
+                    "response-too-large", "servis yanıtı boyut sınırını aştı"),
+                budget)
+        # Protokol hatalarının kendisi de bütçeye sığmıyorsa (çok küçük bir
+        # IPC_MAX_MESSAGE_BYTES) sabit bir çerçeve yaz: yazmamak istemciyi
+        # zaman aşımına bırakırdı.
+        if body is None:
+            body = b'{"ok":false,"code":"response-too-large"}'
+        writer.write(body + b"\n")
         await writer.drain()
 
     async def _client(self, reader: asyncio.StreamReader,
@@ -243,14 +269,14 @@ class IpcClient:
         # JSON kodlama ve çerçeve limiti soket açılmadan önce doğrulanır. Böylece
         # yerel programlama hatası servis erişim hatası gibi raporlanmaz.
         try:
-            payload = (json.dumps(request, ensure_ascii=False).encode("utf-8")
-                       + b"\n")
+            body = _encode_bounded(request, IPC_MAX_MESSAGE_BYTES - 1)
         except (TypeError, ValueError) as exc:
             return _protocol_error(
                 "invalid-request", f"istek JSON olarak kodlanamadı: {exc}")
-        if len(payload) > IPC_MAX_MESSAGE_BYTES:
+        if body is None:
             return _protocol_error(
                 "request-too-large", "istek boyut sınırını aştı")
+        payload = body + b"\n"
 
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(self.timeout)
