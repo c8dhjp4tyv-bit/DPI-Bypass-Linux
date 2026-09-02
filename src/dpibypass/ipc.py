@@ -28,16 +28,81 @@ def _protocol_error(code: str, message: str) -> dict:
     return {"ok": False, "error": message, "code": code}
 
 
-def _encode_bounded(value: Any, limit: int) -> bytes | None:
-    """JSON'u parça parça kodla; bütçe aşılır aşılmaz vazgeç.
+#: Bir sayının, ``true``/``false``/``null`` gibi bir sabitin JSON gösterimi için
+#: fazlasıyla yeten üst sınır. Ölçüm tarafında fazla saymamak önemli: fazla
+#: sayarsak sığan bir yanıtı yanlışlıkla reddederiz.
+_SCALAR_BUDGET = 32
 
-    ``json.dumps`` tüm çıktıyı önce bellekte kurar, bu yüzden boyut sınırı
-    ancak devasa bir dize zaten ayrıldıktan sonra devreye girerdi: 256 KiB'lik
-    çerçeve limiti, yüz megabaytlık bir yanıtın tahsisini engellemez, yalnızca
-    tahsis bittikten sonra yazılmasını engeller. ``iterencode`` parçaları tembel
-    üretir, bu yüzden bütçe aşılınca dönmek tepe bellek kullanımını sınırın
-    hemen üstünde tutar. Sınır aşıldıysa ``None`` döner.
+
+def _iter_mapping(mapping: dict):
+    """Sözlüğü anahtar/değer akışı olarak, tembel biçimde gez."""
+    for key, item in mapping.items():
+        yield key
+        yield item
+
+
+def _within_budget(value: Any, limit: int) -> bool:
+    """Yanıtın bütçeye sığma ihtimalini hiçbir şey tahsis etmeden ölç.
+
+    Bu ön eleme olmadan boyut denetimi geç kalıyor. ``iterencode`` yalnızca
+    *yapıyı* tembel gezer, tek bir dizeyi değil: 20 MB'lık bir dize tek parça
+    olarak gelir, yani hem json'un kaçışlanmış kopyası hem de bizim
+    ``encode("utf-8")`` çıktımız, çerçeve limiti kontrol edilmeden önce ayrılır.
+    Sınırı ancak hiç kodlama yapmadan uygulayabiliriz.
+
+    Gezinti tembeldir ve bütçe tükenir tükenmez durur, bu yüzden devasa bir
+    yanıtın yalnızca ilk birkaç elemanına dokunulur. Ölçü karakter cinsindendir
+    ve ayraçlar/virgüller sayılmaz; yani gerçek bayt boyutunu *eksik* tahmin
+    eder. Yön bilinçli: eksik tahmin en fazla kesin denetime bir tur fazladan
+    iş bırakır, fazla tahmin ise geçerli bir yanıtı reddederdi. Buradan geçen
+    bir yanıt ``limit`` karakterden kısadır, dolayısıyla kodlanmış hâli de en
+    fazla dört katı bayt tutar - sabit bir üst sınır.
     """
+    remaining = limit
+    pending = [iter((value,))]
+    while pending:
+        try:
+            current = next(pending[-1])
+        except StopIteration:
+            pending.pop()
+            continue
+
+        if isinstance(current, str):
+            remaining -= len(current) + 2  # tırnaklar
+        elif isinstance(current, dict):
+            remaining -= 2
+            pending.append(_iter_mapping(current))
+        elif isinstance(current, (list, tuple)):
+            remaining -= 2
+            pending.append(iter(current))
+        else:
+            # Sayılar, bool'lar, None ve json'un kodlayamayacağı her şey. Kodlanamayan
+            # bir tür için karar bizim değil: TypeError'ı encoder üretsin, biz onu
+            # "çok büyük" diye raporlamayalım.
+            remaining -= _SCALAR_BUDGET
+
+        if remaining < 0:
+            return False
+    return True
+
+
+def _encode_bounded(value: Any, limit: int) -> bytes | None:
+    """JSON'u sınırlı bellekle kodla; bütçe aşılırsa ``None`` dön.
+
+    ``json.dumps`` tüm çıktıyı önce bellekte kurar, bu yüzden boyut sınırı ancak
+    devasa bir dize zaten ayrıldıktan sonra devreye girerdi: 256 KiB'lik çerçeve
+    limiti, yüz megabaytlık bir yanıtın tahsisini engellemez, yalnızca tahsis
+    bittikten sonra yazılmasını engeller.
+
+    Sınırı gerçekten uygulamak iki aşama gerektiriyor. Önce hiçbir şey tahsis
+    etmeyen ölçüm, ki tek bir devasa dizeyi de kapsayan tek yol odur; sonra,
+    yalnızca ölçümü geçen yanıtlar için, kesin bayt denetimi. İkinci aşamaya
+    ulaşan her şeyin ``limit`` karakterden kısa olduğu bilinir, bu yüzden tepe
+    bellek kullanımı yanıtın gerçek boyutundan bağımsız olarak sınırlıdır.
+    """
+    if not _within_budget(value, limit):
+        return None
+
     chunks: list[bytes] = []
     total = 0
     for chunk in json.JSONEncoder(ensure_ascii=False).iterencode(value):

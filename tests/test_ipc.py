@@ -136,6 +136,42 @@ class TestBoundedEncoding(unittest.TestCase):
             payload.consumed, 64,
             "kodlayıcı bütçe aşıldıktan sonra da veriyi tüketmeyi sürdürdü")
 
+    def test_a_single_huge_string_is_refused_before_anything_encodes_it(self):
+        """iterencode yapıyı tembel gezer, tek bir dizeyi değil.
+
+        Devasa bir dize tek parça olarak gelir; onu görebilmek için json'un
+        kaçışlanmış kopyasının zaten ayrılmış olması gerekir. Sınır ancak hiç
+        kodlama yapılmadan uygulanabilir, bu yüzden test kodlayıcının hiç
+        kurulmadığını doğrular.
+        """
+        payload = {"ok": True, "data": "x" * 1_000_000}
+
+        with mock.patch.object(
+            ipc.json, "JSONEncoder",
+            side_effect=AssertionError("kodlayıcı bütçe denetiminden önce çalıştı"),
+        ):
+            self.assertIsNone(ipc._encode_bounded(payload, 4096))
+
+    def test_measurement_touches_only_what_it_needs_to_decide(self):
+        # Ölçüm de tembel olmalı: bütçe tükendikten sonra gezinmeyi sürdürmek,
+        # kaçınmaya çalıştığımız işin ta kendisini yapmak olurdu.
+        payload = _LazyHugeList(100_000)
+
+        self.assertFalse(ipc._within_budget({"ok": True, "data": payload}, 4096))
+        self.assertLess(payload.consumed, 64)
+
+    def test_measurement_does_not_reject_a_frame_that_fits(self):
+        # Ölçüm eksik tahmin etmeli: fazla saymak geçerli bir yanıtı reddederdi.
+        frame = {"ok": True, "data": {"ports": [1, 2, 3], "note": "ölçüm", "on": True}}
+
+        self.assertTrue(ipc._within_budget(frame, 256))
+        self.assertIsNotNone(ipc._encode_bounded(frame, 256))
+
+    def test_unencodable_values_stay_the_encoder_s_error_to_raise(self):
+        # "Kodlanamaz" ile "çok büyük" farklı hatalar; ön eleme bunu karıştırmamalı.
+        with self.assertRaises(TypeError):
+            ipc._encode_bounded({"ok": True, "data": object()}, 4096)
+
     def test_encoder_returns_the_exact_frame_when_it_fits(self):
         encoded = ipc._encode_bounded({"ok": True, "data": "ölçüm"}, 4096)
 
